@@ -1,16 +1,6 @@
 #!/usr/bin/env python3
 """
-basic_extractor.py (v3.1) — извлечение псевдокода/формул/условий из DOS .EXE,
-скомпилированных Microsoft BASIC Compiler (BASCOM/QuickBASIC/BASIC PDS)
-с программным эмулятором 8087 (INT 34h-3Bh) и рантайм-функциями сравнения.
-
-Исправления v3.1:
-    - Отключена подстановка 0/целых констант (сохраняются V_XXXX)
-    - Восстановлена работа INPUT (убран агрессивный сброс состояния)
-    - Обрабатываются цепочки jcc после одного strcmp-вызова (исчезли нераспознанные)
-    - Добавлена поддержка cmp/test + jcc для целочисленных условий
-
-pip install capstone
+basic_extractor.py (v3.4) — полная версия с ручным указанием print-числа
 """
 import sys, struct, re, argparse
 from capstone import Cs, CS_ARCH_X86, CS_MODE_16
@@ -30,7 +20,6 @@ def detect_string_segment(data, search_start, search_end):
     votes = {}
     i = search_start
     while i < search_end - 4:
-        # длина записи (поле length) теперь от 1 до 250
         if data[i+1] == 0 and 1 <= data[i] <= 250:
             ptr = data[i+2] | (data[i+3] << 8)
             implied_base = i - (ptr - 4)
@@ -48,14 +37,12 @@ def decode_pstrings(data, seg_start, seg_end):
         flag = data[i+1]
         ptr = data[i+2] | (data[i+3] << 8)
         near_off = i - seg_start
-        # условие length >= 1 вместо 4
         if flag == 0 and ptr == near_off + 4 and length >= 1:
             text_len = length
             if i+4+text_len <= len(data):
                 raw = data[i+4:i+4+text_len]
                 try: text = raw.decode('cp866', errors='replace')
                 except Exception: text = raw.decode('latin1', errors='replace')
-                # принимаем только если все символы печатные или пробел/табуляция
                 if text and all(c.isprintable() or c in ' \t' for c in text):
                     results[near_off] = text
                     i += 1 + length
@@ -84,7 +71,7 @@ def read_const_uint16(data, seg_start, near_off):
     if p+2 > len(data): return None
     return data[p] | (data[p+1] << 8)
 
-# ================= 3. x87 "ESC-через-INT" (без изменений) =================
+# ================= 3. x87 "ESC-через-INT" =================
 def modrm_mem_operand(mod, rm, bytes_at):
     bases = {0:"BX+SI",1:"BX+DI",2:"BP+SI",3:"BP+DI",4:"SI",5:"DI",6:"BP",7:"BX"}
     if mod == 0 and rm == 6:
@@ -198,9 +185,10 @@ def sym(operand):
     if m: return f"ARR_{m.group(1)}[{m.group(2)}]"
     return operand
 
-# ================= 6. Авто-детект целей рантайма (исправлен) =================
+# ================= 6. Авто-детект целей рантайма =================
+LCALL_RE = re.compile(r"lcall\s+(0x[0-9a-f]+)\s*[:,]\s*(0x[0-9a-f]+)")
+
 def auto_detect_calls(instrs, pstrings, data, str_seg_start):
-    call_re = re.compile(r"lcall (0x[0-9a-f]+), (0x[0-9a-f]+)")
     push_imm_re = re.compile(r"push ax$")
     mov_ax_re = re.compile(r"mov ax, (0x[0-9a-f]+|\d+)$")
     mov_bx_re = re.compile(r"mov bx, (0x[0-9a-f]+)$")
@@ -217,10 +205,9 @@ def auto_detect_calls(instrs, pstrings, data, str_seg_start):
         m_ax = mov_ax_re.match(mnem)
         m_bx = mov_bx_re.match(mnem)
         is_push = push_imm_re.match(mnem)
-        mc = call_re.match(mnem)
+        mc = LCALL_RE.match(mnem)                     # <-- новое RE
         is_jump = re.match(r"^(jmp|je|jne|jb|jbe|ja|jae|jl|jle|jg|jge|loop|jcxz|call)", mnem)
 
-        # Сброс, только если инструкция не часть цепочки и не переход
         if not (m_ax or m_bx or is_push or mc or is_jump):
             last_imm = None
             pushes_since_call = []
@@ -232,13 +219,13 @@ def auto_detect_calls(instrs, pstrings, data, str_seg_start):
             continue
         if m_ax:
             last_imm = int(m_ax.group(1),16) if m_ax.group(1).startswith('0x') else int(m_ax.group(1))
-            # НЕ сбрасываем pushes_since_call, так как для strcmp нужно два push подряд
             continue
         if is_push and last_imm is not None:
             pushes_since_call.append(last_imm)
             continue
         if mc:
-            tgt = (int(mc.group(1),16), int(mc.group(2),16))
+            seg, off = int(mc.group(1),16), int(mc.group(2),16)
+            tgt = (seg, off)
             if pushes_since_call and pushes_since_call[-1] in pstrings:
                 print_votes[tgt] = print_votes.get(tgt,0) + 1
             if last_mov_bx is not None:
@@ -254,16 +241,15 @@ def auto_detect_calls(instrs, pstrings, data, str_seg_start):
             last_imm = None
             continue
 
-        # Переходы не влияют
         if is_jump:
             continue
 
-    # Второй проход для float-compare (без изменений)
+    # Второй проход для float-compare
     for idx in range(2, len(instrs)-1):
         off,kind,mnem,length,near,fa = instrs[idx]
         if kind=='X86' and mnem.startswith('int '):
             o1,k1,m1,l1,n1,f1 = instrs[idx+1]
-            mc = call_re.match(m1) if k1=='X86' else None
+            mc = LCALL_RE.match(m1) if k1=='X86' else None
             if mc:
                 o2,k2,m2,l2,n2,f2 = instrs[idx-1]
                 if k2=='FPU' and m2.startswith('FLD'):
@@ -273,7 +259,7 @@ def auto_detect_calls(instrs, pstrings, data, str_seg_start):
     pick = lambda votes: max(votes.items(), key=lambda kv: kv[1])[0] if votes else None
     return pick(print_votes), pick(input_votes), pick(strcmp_votes), pick(floatcmp_votes)
 
-# ================= 7. Реконструкция условий (расширенная) =================
+# ================= 7. Реконструкция условий =================
 JCC_MAP = {'je':'==','jne':'!=','jb':'<','jbe':'<=','ja':'>','jae':'>=','jl':'<','jle':'<=','jg':'>','jge':'>='}
 
 def parse_cmp_operands(mnem):
@@ -284,16 +270,15 @@ def parse_cmp_operands(mnem):
     return None, None, None
 
 def reconstruct_conditions(instrs, data, str_seg_start, strcmp_target, floatcmp_target):
-    call_re = re.compile(r"lcall (0x[0-9a-f]+), (0x[0-9a-f]+)")
+    # Аналогично заменим call_re на LCALL_RE
+    call_re = LCALL_RE
     jump_re = re.compile(r"^(j[a-z]+)\s+(0x[0-9a-f]+)$")
+    conditions = {}
 
-    conditions = {}   # idx -> текст условия
-
-    # ---------- 7.1 Float/strcmp условия ----------
+    # Float/strcmp
     stack_fpu = []
     push_imm_hist = []
     last_imm = None
-
     i, n = 0, len(instrs)
     while i < n:
         off,kind,mnem,length,near,fa = instrs[i]
@@ -318,8 +303,7 @@ def reconstruct_conditions(instrs, data, str_seg_start, strcmp_target, floatcmp_
                 elif op=="FCHS": stack_fpu[0]=f"(-{stack_fpu[0]})"
                 elif op in ("FCOMP","FUCOMP"): stack_fpu.pop(0)
                 elif op == "FCOMPP": stack_fpu.pop(0); stack_fpu.pop(0)
-            except Exception:
-                pass
+            except Exception: pass
             i+=1; continue
 
         m = re.match(r"mov ax, (0x[0-9a-f]+|\d+)$", mnem)
@@ -340,17 +324,14 @@ def reconstruct_conditions(instrs, data, str_seg_start, strcmp_target, floatcmp_
                     while j<n:
                         _,kj,mj,_,_,_ = instrs[j]
                         if kj!='X86' or not jump_re.match(mj):
-                            if kj=='X86' and not (re.match(r"^(mov|lea|push|pop|nop|xchg)", mj)):
-                                break
+                            if kj=='X86' and not (re.match(r"^(mov|lea|push|pop|nop|xchg)", mj)): break
                             j+=1; continue
                         jm = jump_re.match(mj)
                         if jm and jm.group(1)!='jmp':
                             opy = JCC_MAP.get(jm.group(1),'?')
                             conditions[j] = f"{a} {opy} {b}"
-                        j+=1
-                        break
-                except Exception:
-                    pass
+                        j+=1; break
+                except Exception: pass
             elif strcmp_target and tgt==strcmp_target and len(push_imm_hist)==2:
                 lit = None
                 for cand in (push_imm_hist[0], push_imm_hist[1]):
@@ -359,30 +340,25 @@ def reconstruct_conditions(instrs, data, str_seg_start, strcmp_target, floatcmp_
                         lit = lit_try; break
                 if lit is not None:
                     j = i+1
-                    # Продолжаем обрабатывать ВСЕ jcc после вызова
                     while j<n:
                         _,kj,mj,_,_,_ = instrs[j]
                         if kj!='X86' or not jump_re.match(mj):
-                            if kj=='X86' and not (re.match(r"^(mov|lea|push|pop|nop|xchg)", mj)):
-                                break  # инструкция, меняющая флаги -> стоп
+                            if kj=='X86' and not (re.match(r"^(mov|lea|push|pop|nop|xchg)", mj)): break
                             j+=1; continue
                         jm = jump_re.match(mj)
                         if jm and jm.group(1)!='jmp':
                             opy = JCC_MAP.get(jm.group(1),'?')
                             conditions[j] = f"input_str {opy} {lit!r}"
-                            j+=1
-                            continue  # смотрим дальше
-                        else:
-                            break  # безусловный переход — дальше условия не нужны
+                            j+=1; continue
+                        else: break
                 push_imm_hist = []
             i+=1; continue
 
-        # Сброс при инструкциях, меняющих флаги
         if kind=='X86' and not re.match(r"^(mov|lea|push|pop|nop|xchg|call)", mnem):
             push_imm_hist = []
         i+=1
 
-    # ---------- 7.2 Целочисленные cmp/test ----------
+    # Целочисленные cmp/test
     for idx in range(1, len(instrs)):
         _,k1,m1,_,_,_ = instrs[idx-1]
         _,k2,m2,_,_,_ = instrs[idx]
@@ -400,29 +376,45 @@ def reconstruct_conditions(instrs, data, str_seg_start, strcmp_target, floatcmp_
             else: conditions[idx] = f"({left} & {right}) {op} 0"
         else:
             conditions[idx] = f"{left} {op} {right}"
-
     return conditions
 
-# ================= 8. Поиск констант (без подстановки 0) =================
+# ================= 8. Поиск констант =================
 def lookup_var_value(var_name, data, str_seg_start, pstrings):
-    """Подставляет только не-нулевые float, целые не подставляем (сохраняем V_XXXX)."""
     m = re.match(r"V_([0-9a-f]+)", var_name)
     if not m: return None
     off = int(m.group(1), 16)
-    # Пробуем float, но не 0.0
     f = read_const_float(data, str_seg_start, off)
     if f is not None and abs(f) > 1e-6:
-        # Пропускаем явные константы (например, pi)
         return f"{f:g}"
-    # Целые не возвращаем, чтобы не затирать переменные
     return None
 
 # ================= 9. Псевдокод =================
-def build_pseudocode(instrs, pstrings, print_target, input_target, conditions, data, str_seg_start, seg_label="CODE"):
+def build_pseudocode(instrs, pstrings, print_target, input_target, conditions,
+                     data, str_seg_start, print_num_target=None, seg_label="CODE"):
     call_re = re.compile(r"lcall (0x[0-9a-f]+), (0x[0-9a-f]+)")
     jump_re = re.compile(r"^(j[a-z]+)\s+(0x[0-9a-f]+)$")
     last_imm = None; last_mov_bx = None; pending_push = None
     lines = []; stack_fpu = []
+
+    # --- Сбор всех целей переходов ---
+    jump_targets = set()
+    for idx, (off, kind, mnem, length, near, fa) in enumerate(instrs):
+        if kind != 'X86': continue
+        # безусловные jmp
+        if mnem.startswith('jmp'):
+            m = re.match(r"jmp\s+(0x[0-9a-f]+)", mnem)
+            if m: jump_targets.add(int(m.group(1), 16))
+        # условные jcc
+        mj = jump_re.match(mnem)
+        if mj and mj.group(1) != 'jmp':
+            target = int(mj.group(2), 16)
+            if idx in conditions:
+                # IF NOT ... GOTO – цель тоже добавляем
+                jump_targets.add(target)
+            else:
+                # нераспознанный jcc – всё равно цель
+                jump_targets.add(target)
+        # также lcall? не обязательно.
 
     def format_operand(op):
         if op.startswith("V_"):
@@ -432,12 +424,19 @@ def build_pseudocode(instrs, pstrings, print_target, input_target, conditions, d
 
     for idx,(off,kind,mnem,length,near,fa) in enumerate(instrs):
         addr_s = f"{seg_label}:{off:04x}"
+        generated = False   # была ли сгенерирована строка для этого адреса
+
         if kind == 'X86':
             m = re.match(r"mov bx, (0x[0-9a-f]+)$", mnem)
             if m: last_mov_bx = int(m.group(1),16)
             m = re.match(r"mov (\w+), (0x[0-9a-f]+|\d+)$", mnem)
             if m and m.group(1) in ('ax','bx','cx','dx'):
                 last_imm = int(m.group(2),16) if m.group(2).startswith('0x') else int(m.group(2))
+                continue
+            # прямой push word ptr [0x…]
+            m_push = re.match(r"push word ptr \[(0x[0-9a-f]+)\]", mnem)
+            if m_push:
+                pending_push = int(m_push.group(1), 16)
                 continue
             if mnem.startswith("push ax") and last_imm is not None:
                 pending_push = last_imm; continue
@@ -447,9 +446,21 @@ def build_pseudocode(instrs, pstrings, print_target, input_target, conditions, d
                 if tgt == print_target and pending_push in pstrings:
                     lines.append(f"{addr_s}: PRINT \"{pstrings[pending_push].strip()}\"")
                     pending_push = None
-                elif tgt == input_target and last_mov_bx is not None:
-                    lines.append(f"{addr_s}: INPUT -> V_{last_mov_bx:04x}")
+                    generated = True
+                elif tgt == input_target and (last_mov_bx is not None or pending_push is not None):
+                    val = last_mov_bx if last_mov_bx is not None else pending_push
+                    lines.append(f"{addr_s}: INPUT -> V_{val:04x}")
                     last_mov_bx = None
+                    pending_push = None
+                elif print_num_target is not None and tgt == print_num_target and pending_push is not None:
+                    if pending_push > 0xF and pending_push not in pstrings:
+                        lines.append(f"{addr_s}: PRINT V_{pending_push:04x}")
+                    pending_push = None
+                elif print_num_target is not None and tgt == print_num_target and pending_push is not None:
+                    if pending_push > 0xF and pending_push not in pstrings:
+                        lines.append(f"{addr_s}: PRINT V_{pending_push:04x}")
+                    pending_push = None
+                    generated = True
                 continue
             mj = jump_re.match(mnem)
             if mj:
@@ -463,11 +474,17 @@ def build_pseudocode(instrs, pstrings, print_target, input_target, conditions, d
                         right = format_operand(right)
                         cond = f"{left} {op} {right}"
                     lines.append(f"{addr_s}: IF NOT ({cond}) GOTO 0x{target:04x}")
+                    generated = True
                 else:
-                    lines.append(f"{addr_s}: {jcc} 0x{target:04x}" + ("" if jcc=='jmp' else "  [условие не распознано]"))
+                    if jcc == 'jmp':
+                        lines.append(f"{addr_s}: jmp 0x{target:04x}")
+                    else:
+                        lines.append(f"{addr_s}: {jcc} 0x{target:04x}  [условие не распознано]")
+                    generated = True
                 continue
             if mnem.startswith("ret"):
                 lines.append(f"{addr_s}: RETURN")
+                generated = True
         elif kind == 'FPU':
             parts = mnem.split(" ",1); op=parts[0]; rest=parts[1] if len(parts)>1 else ""
             try:
@@ -480,6 +497,7 @@ def build_pseudocode(instrs, pstrings, print_target, input_target, conditions, d
                     target_disp = format_operand(target)
                     rhs_disp = format_operand(rhs)
                     lines.append(f"{addr_s}: FORMULA {target_disp} = {rhs_disp}")
+                    generated = True
                     if op=="FSTP": stack_fpu.pop(0)
                 elif op in ("FADD","FSUB","FMUL","FDIV","FSUBR","FDIVR"):
                     b = sym(rest.split(" ",1)[1].strip()) if ("m32real" in rest or "m64real" in rest) else rest
@@ -491,6 +509,12 @@ def build_pseudocode(instrs, pstrings, print_target, input_target, conditions, d
                 elif op=="FCHS": stack_fpu[0]=f"(-{stack_fpu[0]})"
             except Exception:
                 stack_fpu = []
+            continue
+
+        # Если для данного адреса не сгенерировано строки, но он является целью перехода – вставим метку
+        if not generated and off in jump_targets:
+            lines.append(f"{addr_s}: ; метка перехода")
+
     return lines
 
 # ================= main =================
@@ -499,6 +523,10 @@ def main():
     ap.add_argument("exe")
     ap.add_argument("--out", default="extracted")
     ap.add_argument("--max-scan", type=lambda x:int(x,0), default=None)
+    ap.add_argument("--print-num-seg", type=lambda x:int(x,0), default=None)
+    ap.add_argument("--print-num-off", type=lambda x:int(x,0), default=None)
+    ap.add_argument("--input-seg", type=lambda x:int(x,0), default=None)
+    ap.add_argument("--input-off", type=lambda x:int(x,0), default=None)
     args = ap.parse_args()
 
     with open(args.exe,'rb') as f: data = f.read()
@@ -532,10 +560,21 @@ def main():
     print(f"    PRINT_TEXT: {print_t}   INPUT_READ: {input_t}")
     print(f"    STRCMP: {strcmp_t}   FLOAT_COMPARE_HELPER: {floatcmp_t}")
 
+    input_t = input_t   # из auto_detect_calls
+    if args.input_seg is not None and args.input_off is not None:
+        input_t = (args.input_seg, args.input_off)
+        print(f"    INPUT_READ (ручной): {input_t}")
+
+    print_num_t = None
+    if args.print_num_seg is not None and args.print_num_off is not None:
+        print_num_t = (args.print_num_seg, args.print_num_off)
+        print(f"    PRINT_NUM (ручной): {print_num_t}")
+
     conditions = reconstruct_conditions(instrs, data, str_seg, strcmp_t, floatcmp_t)
     print(f"[+] Условий восстановлено: {len(conditions)}")
 
-    lines = build_pseudocode(instrs, pstrings, print_t, input_t, conditions, data, str_seg)
+    lines = build_pseudocode(instrs, pstrings, print_t, input_t, conditions,
+                             data, str_seg, print_num_target=print_num_t)
     with open(f"{args.out}_pseudocode.txt",'w',encoding='utf-8') as f:
         f.write("\n".join(lines))
     print(f"[+] Псевдокод: {len(lines)} строк -> {args.out}_pseudocode.txt")

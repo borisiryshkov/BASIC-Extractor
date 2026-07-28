@@ -1,4 +1,3 @@
-```markdown
 # README.md – basic_extractor.py
 
 ## About this project
@@ -192,4 +191,3 @@ This project is provided under the MIT License – feel free to use, modify, and
 ---
 
 **Happy reversing!**
-```

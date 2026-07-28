@@ -1,12 +1,23 @@
 #!/usr/bin/env python3
 """
-basic_extractor.py (v3.10) — стабильная версия с правильными константами,
-нормализацией сравнений, списками переменных и констант.
+basic_extractor.py — A static analysis tool for 16-bit DOS MZ executables.
+Extracts string literals, constants, and produces structured pseudocode.
+It disassembles x86 code, detects print/input routines, reconstructs conditions,
+and generates readable Python-like output with variable and constant lists.
+
+Command-line arguments:
+  exe                  : input executable file
+  --out PREFIX         : output files prefix (default: 'extracted')
+  --max-scan N         : maximum code bytes to scan (default: all)
+  --print-num-seg SEG  : segment of print-number routine (hex)
+  --print-num-off OFF  : offset of print-number routine (hex)
+  --input-seg SEG      : segment of input-read routine (hex)
+  --input-off OFF      : offset of input-read routine (hex)
 """
 import sys, struct, re, argparse, bisect
 from capstone import Cs, CS_ARCH_X86, CS_MODE_16
 
-# ================= 1. MZ header =================
+# ================= 1. MZ header parsing =================
 def parse_mz_header(data):
     if data[0:2] != b'MZ': raise ValueError("Not an MZ executable")
     fields = struct.unpack_from('<14H', data, 2)
@@ -16,7 +27,7 @@ def parse_mz_header(data):
     h['header_bytes'] = h['e_cparhdr'] * 16
     return h
 
-# ================= 2. Строковый сегмент =================
+# ================= 2. String segment detection =================
 def detect_string_segment(data, search_start, search_end):
     votes = {}
     i = search_start
@@ -72,7 +83,7 @@ def read_const_uint16(data, seg_start, near_off):
     if p+2 > len(data): return None
     return data[p] | (data[p+1] << 8)
 
-# ================= 3. x87 "ESC-через-INT" =================
+# ================= 3. x87 "ESC via INT" decoding =================
 def modrm_mem_operand(mod, rm, bytes_at):
     bases = {0:"BX+SI",1:"BX+DI",2:"BP+SI",3:"BP+DI",4:"SI",5:"DI",6:"BP",7:"BX"}
     if mod == 0 and rm == 6:
@@ -154,7 +165,7 @@ def decode_DF(mod,reg,rm,mb):
 DECODERS = {0x34:decode_D8,0x35:decode_D9,0x36:decode_DA,0x37:decode_DB,
             0x38:decode_DC,0x39:decode_DD,0x3a:decode_DE,0x3b:decode_DF}
 
-# ================= 4. Комбинированный дизассемблер =================
+# ================= 4. Combined disassembler =================
 _md = Cs(CS_ARCH_X86, CS_MODE_16)
 
 def disasm_range(data, start, end, label_base=None, stop_on_ret=False):
@@ -192,7 +203,7 @@ def sym(operand):
     if m: return f"ARR_{m.group(1)}[{m.group(2)}]"
     return operand
 
-# ================= 6. Авто-детект целей рантайма =================
+# ================= 6. Auto-detection of runtime call targets =================
 LCALL_RE = re.compile(r"lcall\s+(0x[0-9a-f]+)\s*[:,]\s*(0x[0-9a-f]+)")
 
 def auto_detect_calls(instrs, pstrings, data, str_seg_start):
@@ -259,7 +270,7 @@ def auto_detect_calls(instrs, pstrings, data, str_seg_start):
     pick = lambda votes: max(votes.items(), key=lambda kv: kv[1])[0] if votes else None
     return pick(print_votes), pick(input_votes), pick(strcmp_votes), pick(floatcmp_votes)
 
-# ================= 7. Реконструкция условий =================
+# ================= 7. Condition reconstruction =================
 JCC_MAP = {'je':'==','jne':'!=','jb':'<','jbe':'<=','ja':'>','jae':'>=','jl':'<','jle':'<=','jg':'>','jge':'>='}
 
 def parse_cmp_operands(mnem):
@@ -274,7 +285,7 @@ def reconstruct_conditions(instrs, data, str_seg_start, strcmp_target, floatcmp_
     jump_re = re.compile(r"^(j[a-z]+)\s+(0x[0-9a-f]+)$")
     conditions = {}
 
-    # Float/strcmp
+    # Float / strcmp handling
     stack_fpu = []
     push_imm_hist = []
     last_imm = None
@@ -366,7 +377,7 @@ def reconstruct_conditions(instrs, data, str_seg_start, strcmp_target, floatcmp_
             push_imm_hist = []
         i+=1
 
-    # OR-комбинации strcmp
+    # OR combinations for strcmp
     for idx in range(3, len(instrs)):
         o0,k0,m0,_,_,_ = instrs[idx-3]
         o1,k1,m1,_,_,_ = instrs[idx-2]
@@ -388,7 +399,7 @@ def reconstruct_conditions(instrs, data, str_seg_start, strcmp_target, floatcmp_
             elif jcc == 'jne':
                 conditions[idx] = f"input_str == {lit1!r} or input_str == {lit2!r}"
 
-    # Целочисленные cmp/test с нормализацией
+    # Integer cmp/test with normalisation
     def resolve_operand(op_str):
         if op_str is None:
             return None
@@ -434,7 +445,7 @@ def reconstruct_conditions(instrs, data, str_seg_start, strcmp_target, floatcmp_
 
     return conditions
 
-# ================= 8. Поиск констант =================
+# ================= 8. Constant lookup =================
 def lookup_var_value(var_name, data, data_seg_start, pstrings):
     m = re.match(r"V_([0-9a-f]+)", var_name)
     if not m: return None
@@ -444,7 +455,7 @@ def lookup_var_value(var_name, data, data_seg_start, pstrings):
         return f"{f:g}"
     return None
 
-# ================= 9. Псевдокод =================
+# ================= 9. Pseudocode generation =================
 def detect_choice_writes(instrs, input_target, pstrings):
     results = []
     n = len(instrs)
@@ -519,7 +530,7 @@ def build_pseudocode(instrs, pstrings, print_target, input_target, conditions,
     last_imm = None; last_mov_bx = None; pending_push = None
     lines = []; stack_fpu = []
 
-    # Флаг для подавления следующего INPUT V_0690 после обёртки ввода
+    # Flag to suppress the next INPUT V_0690 after an input wrapper
     suppress_next_0690 = False
 
     emitted_addrs = []
@@ -608,7 +619,7 @@ def build_pseudocode(instrs, pstrings, print_target, input_target, conditions,
                 elif tgt == input_target and (last_mov_bx is not None or pending_push is not None):
                     val = last_mov_bx if last_mov_bx is not None else pending_push
                     if suppress_next_0690 and val == 0x0690:
-                        # Подавляем дублирующий INPUT
+                        # Suppress duplicate INPUT
                         suppress_next_0690 = False
                         last_mov_bx = None
                         pending_push = None
@@ -637,9 +648,9 @@ def build_pseudocode(instrs, pstrings, print_target, input_target, conditions,
                     if jcc == 'jmp':
                         lines.append(f"{addr_s}: jmp {target_str}")
                     else:
-                        lines.append(f"{addr_s}: {jcc} {target_str}  [условие не распознано]")
+                        lines.append(f"{addr_s}: {jcc} {target_str}  [condition not recognised]")
                 generated = True
-                # jmp не сбрасывает suppress_next_0690, он сохраняется
+                # jmp does not reset suppress_next_0690, it persists
                 continue
             mcall_near = re.match(r"^call (0x[0-9a-f]+)$", mnem)
             if mcall_near:
@@ -654,7 +665,7 @@ def build_pseudocode(instrs, pstrings, print_target, input_target, conditions,
                         base = struct.unpack_from('<H', window, idx+6)[0]
                 if base is not None:
                     lines.append(f"{addr_s}: INPUT -> V_{base:04x}")
-                    suppress_next_0690 = True   # следующий INPUT 0690 будет подавлен
+                    suppress_next_0690 = True   # suppress the next INPUT 0690
                     generated = True
                 else:
                     lines.append(f"{addr_s}: CALL_SUB 0x{call_target_rel:04x}")
@@ -689,7 +700,7 @@ def build_pseudocode(instrs, pstrings, print_target, input_target, conditions,
             continue
 
         if not generated and off in jump_targets:
-            lines.append(f"{addr_s}: ; метка перехода")
+            lines.append(f"{addr_s}: ; jump target label")
             suppress_next_0690 = False
 
     def replace_arr(match):
@@ -697,7 +708,7 @@ def build_pseudocode(instrs, pstrings, print_target, input_target, conditions,
         return f"V_{offset:04x}"
     lines = [re.sub(r"ARR_(SI|DI|BX|BP)\[(\+\d+)\]", replace_arr, line) for line in lines]
 
-    # Удаление jmp в никуда
+    # Remove dead jmp instructions
     existing_addrs = set()
     for line in lines:
         m = re.match(r"^CODE:([0-9a-f]+):", line)
@@ -713,7 +724,7 @@ def build_pseudocode(instrs, pstrings, print_target, input_target, conditions,
         new_lines.append(line)
     lines = new_lines
 
-    # Удаление CALL_SUB, идущих сразу после PRINT
+    # Remove CALL_SUB immediately following PRINT
     cleaned = []
     prev_was_print = False
     for line in lines:
@@ -734,7 +745,7 @@ def build_pseudocode(instrs, pstrings, print_target, input_target, conditions,
 
 # ================= main =================
 
-# ================= СТРУКТУРИРОВАНИЕ if/while =================
+# ================= Structuring if/while =================
 
 class Stmt:
     __slots__ = ('addr','kind','text','target','cond')
@@ -873,10 +884,10 @@ def render(stmts, addr2idx, loops, lo, hi, depth=0):
         elif s.kind == 'JMP':
             tgt_idx = addr2idx.get(s.target)
             if tgt_idx is not None and tgt_idx > i:
-                out.append(f"{pad}# --- goto CODE:{s.target:04x} (пропуск блока ниже) ---")
+                out.append(f"{pad}# --- goto CODE:{s.target:04x} (skip block below) ---")
                 i = tgt_idx
             else:
-                out.append(f"{pad}# GOTO CODE:{s.target:04x}  [нераспознанный переход назад]")
+                out.append(f"{pad}# GOTO CODE:{s.target:04x}  [unrecognised backward jump]")
                 i += 1
         elif s.kind == 'IF':
             ladder = detect_ladder(stmts, addr2idx, i)
@@ -897,11 +908,11 @@ def render(stmts, addr2idx, loops, lo, hi, depth=0):
                 i = tgt_idx
             elif tgt_idx is not None and tgt_idx <= i:
                 out.append(f"{pad}if {s.cond}:")
-                out.append(f"{pad}{INDENT}continue  # переход назад к телу цикла")
+                out.append(f"{pad}{INDENT}continue  # backward jump to loop header")
                 i += 1
             else:
                 out.append(f"{pad}if {s.cond}:")
-                out.append(f"{pad}{INDENT}pass  # GOTO CODE:{s.target:04x} [сложный переход, не структурирован]")
+                out.append(f"{pad}{INDENT}pass  # GOTO CODE:{s.target:04x} [complex jump, not structured]")
                 i += 1
         else:
             i += 1
@@ -932,7 +943,7 @@ def render_loop_body(stmts, addr2idx, loops, header_idx, back_idx, depth):
             if tgt_idx == header_idx:
                 i += 1
             elif tgt_idx is not None and tgt_idx > back_idx:
-                out.append(f"{pad}break  # --- goto CODE:{s.target:04x} (выход из цикла) ---")
+                out.append(f"{pad}break  # --- goto CODE:{s.target:04x} (exit loop) ---")
                 i += 1
             elif tgt_idx is not None and tgt_idx > i:
                 out.append(f"{pad}# --- goto CODE:{s.target:04x} ---")
@@ -948,7 +959,7 @@ def render_loop_body(stmts, addr2idx, loops, header_idx, back_idx, depth):
                 i += 1
             elif tgt_idx is not None and tgt_idx > back_idx:
                 out.append(f"{pad}if {s.cond}:")
-                out.append(f"{pad}{INDENT}break  # --- goto CODE:{s.target:04x} (выход из цикла) ---")
+                out.append(f"{pad}{INDENT}break  # --- goto CODE:{s.target:04x} (exit loop) ---")
                 i += 1
             elif tgt_idx is not None and tgt_idx == i+1:
                 i += 1
@@ -959,7 +970,7 @@ def render_loop_body(stmts, addr2idx, loops, header_idx, back_idx, depth):
                 i = tgt_idx
             else:
                 out.append(f"{pad}if {s.cond}:")
-                out.append(f"{pad}{INDENT}pass  # GOTO CODE:{s.target:04x} [сложный переход внутри цикла]")
+                out.append(f"{pad}{INDENT}pass  # GOTO CODE:{s.target:04x} [complex jump inside loop]")
                 i += 1
         else:
             i += 1
@@ -972,7 +983,7 @@ def structure_pseudocode(lines):
     body = render(stmts, addr2idx, loops, 0, len(stmts), depth=0)
     return "\n".join(body)
 
-# ================= РАСПОЗНАВАНИЕ ОБЁРТОК ВВОДА =================
+# ================= Recognition of input wrappers =================
 def decode_opaque_input_wrapper(data, file_offset):
     try:
         if data[file_offset:file_offset+11] != b'\x58\x05\x0D\x00\x0E\x50\x9A\x88\x47\xBD\x09':
@@ -1019,46 +1030,46 @@ def main():
 
     str_seg = detect_string_segment(data, code_start, code_end)
     if str_seg is None:
-        print("[-] Строковый сегмент не найден, используется начало кода")
+        print("[-] String segment not found, using code start instead")
         str_seg = code_start
     else:
-        print(f"[+] Строковый сегмент: file offset 0x{str_seg:x}")
+        print(f"[+] String segment: file offset 0x{str_seg:x}")
     pstrings = decode_pstrings(data, str_seg, code_end)
-    print(f"[+] Строк: {len(pstrings)}")
+    print(f"[+] Strings: {len(pstrings)}")
     with open(f"{args.out}_strings.txt",'w',encoding='utf-8') as f:
         for off,txt in sorted(pstrings.items()): f.write(f"0x{off:04x}: {txt}\n")
 
     scan_end = str_seg
     if args.max_scan is not None:
         scan_end = min(scan_end, code_start+args.max_scan)
-        print(f"[+] Ограничение сканирования: 0x{args.max_scan:x}")
+        print(f"[+] Scan limit: 0x{args.max_scan:x}")
 
-    print("[+] Дизассемблирование...")
+    print("[+] Disassembling...")
     instrs = disasm_range(data, code_start, scan_end)
-    print(f"[+] Инструкций: {len(instrs)}")
+    print(f"[+] Instructions: {len(instrs)}")
 
     data_seg = str_seg
 
-    print("[+] Автоопределение целей вызова...")
+    print("[+] Auto-detecting call targets...")
     print_t, input_t, strcmp_t, floatcmp_t = auto_detect_calls(instrs, pstrings, data, str_seg)
     print(f"    PRINT_TEXT: {print_t}   INPUT_READ: {input_t}")
     print(f"    STRCMP: {strcmp_t}   FLOAT_COMPARE_HELPER: {floatcmp_t}")
 
     if args.input_seg is not None and args.input_off is not None:
         input_t = (args.input_seg, args.input_off)
-        print(f"    INPUT_READ (ручной): {input_t}")
+        print(f"    INPUT_READ (manual): {input_t}")
 
     print_num_t = None
     if args.print_num_seg is not None and args.print_num_off is not None:
         print_num_t = (args.print_num_seg, args.print_num_off)
-        print(f"    PRINT_NUM (ручной): {print_num_t}")
+        print(f"    PRINT_NUM (manual): {print_num_t}")
 
     conditions = reconstruct_conditions(instrs, data, str_seg, strcmp_t, floatcmp_t)
 
     lines = build_pseudocode(instrs, pstrings, print_t, input_t, conditions,
                              data, data_seg, print_num_target=print_num_t, code_start=code_start)
 
-    print("[+] Поиск подпрограмм (near CALL)...")
+    print("[+] Searching for subroutines (near CALL)...")
     call_re_near = re.compile(r"^call (0x[0-9a-f]+)$")
 
     def find_call_targets_with_idx(instr_list):
@@ -1106,22 +1117,22 @@ def main():
             caller_context.setdefault(t2, (sub_instrs, idx2))
             if t2 not in processed_subs and t2 not in discarded_subs and t2 not in opaque_helpers:
                 worklist.append(t2)
-    print(f"[+] Найдено и раскрыто подпрограмм: {len(processed_subs)}")
-    # Обрезаем подпрограммы, чтобы они не захватывали код следующих
+    print(f"[+] Subroutines found and expanded: {len(processed_subs)}")
+    # Trim subroutines so they don't capture following code
     starts = sorted(processed_subs.keys())
     for i, t_rel in enumerate(starts):
         next_start = starts[i+1] if i+1 < len(starts) else None
         if next_start is not None:
             max_addr = next_start - 1
             sub_instrs, sub_lines = processed_subs[t_rel]
-            # Запоминаем все ret
+            # Remember all ret instructions
             ret_instrs = [instr for instr in sub_instrs if instr[2].startswith('ret')]
             new_sub_instrs = [instr for instr in sub_instrs if instr[5] <= code_start + max_addr]
-            # Если какой-то ret был выброшен, возвращаем его
+            # If any ret was removed, add it back
             for ret_instr in ret_instrs:
                 if ret_instr not in new_sub_instrs:
                     new_sub_instrs.append(ret_instr)
-            # Сортируем по файловому адресу, чтобы порядок инструкций сохранился
+            # Sort by file address to preserve order
             new_sub_instrs.sort(key=lambda x: x[5])
             if new_sub_instrs != sub_instrs:
                 sub_conditions = reconstruct_conditions(new_sub_instrs, data, str_seg, strcmp_t, floatcmp_t)
@@ -1129,9 +1140,9 @@ def main():
                                                  data, data_seg, print_num_target=print_num_t, code_start=code_start)
                 processed_subs[t_rel] = (new_sub_instrs, new_sub_lines)
     if opaque_helpers:
-        print(f"[!] Непрозрачных вспомогательных функций: {len(opaque_helpers)}")
+        print(f"[!] Opaque helper functions: {len(opaque_helpers)}")
     if discarded_subs:
-        print(f"[!] Отброшено подозрительных 'call': {len(discarded_subs)}")
+        print(f"[!] Suspect calls discarded: {len(discarded_subs)}")
 
     sub_ranges = []
     for t_rel, (sub_instrs, sub_lines) in processed_subs.items():
@@ -1159,7 +1170,7 @@ def main():
     if sub_ranges:
         removed_before = len(lines)
         lines = strip_phantom_lines(lines)
-        print(f"[+] Убрано фантомных строк: {removed_before - len(lines)}")
+        print(f"[+] Phantom lines removed: {removed_before - len(lines)}")
 
     main_lines = lines[:]
     all_lines_for_analysis = list(lines)
@@ -1274,16 +1285,16 @@ def main():
         if t_rel in processed_subs:
             return line
         elif t_rel in opaque_helpers:
-            return (f"{addr_s}: CALL_SUB {target_hex}  [нестандартный вызов — использует свой "
-                     f"адрес возврата как данные, не подчиняется call/ret; не разворачиваем]")
+            return (f"{addr_s}: CALL_SUB {target_hex}  [non‑standard call — uses its own return address "
+                     f"as data, does not obey call/ret; not expanded]")
         elif t_rel in discarded_subs:
-            return (f"{addr_s}: CALL_SUB {target_hex}  [не удалось разобрать как подпрограмму — "
-                     f"вероятно, ложное срабатывание на данных]")
+            return (f"{addr_s}: CALL_SUB {target_hex}  [could not be resolved as subroutine — "
+                     f"likely a false positive on data]")
         else:
-            return f"{addr_s}: CALL_SUB {target_hex}  [статус неизвестен]"
+            return f"{addr_s}: CALL_SUB {target_hex}  [status unknown]"
     lines = [annotate_call_sub_line(l) for l in lines]
 
-    print("[+] Поиск подпрограмм со статически известным индексом...")
+    print("[+] Searching for subroutines with statically known index...")
     call_sub_re2 = re.compile(r"^(CODE:([0-9a-f]+)): CALL_SUB (0x[0-9a-f]+)$")
     formula_re = re.compile(r"^CODE:([0-9a-f]+): FORMULA V_([0-9a-f]+) = (.+)$")
 
@@ -1332,10 +1343,10 @@ def main():
                       and len(consts) == len(all_calls_to_target.get(t_rel, []))}
     to_specialize.pop(0x0d79, None)
 
-    print(f"[+] Подпрограмм со статически известным индексом: {len(to_specialize)}")
+    print(f"[+] Subroutines with statically known index: {len(to_specialize)}")
     for t_rel, consts in to_specialize.items():
         idx_addr = sub_index_info[t_rel]['index_addr']
-        print(f"    0x{t_rel:04x}: индекс V_{idx_addr:04x}, константы {sorted(set(consts.values()))}")
+        print(f"    0x{t_rel:04x}: index V_{idx_addr:04x}, constants {sorted(set(consts.values()))}")
 
     def specialize_subroutine_lines(t_rel, const_val):
         si, _ = processed_subs[t_rel]
@@ -1398,7 +1409,7 @@ def main():
         idx_addr = sub_index_info[t_rel]['index_addr']
         suffix = call_target_suffix(t_rel, const_val)
         lines.append(f"; ===== SUBROUTINE @{suffix} "
-                     f"(индекс V_{idx_addr:04x} = {const_val:g}, определено распространением констант) =====")
+                     f"(index V_{idx_addr:04x} = {const_val:g}, constant propagation applied) =====")
         lines.extend(spec_lines)
         lines.append(f"; ===== END SUBROUTINE @{suffix} =====")
 
@@ -1406,9 +1417,9 @@ def main():
 
     with open(f"{args.out}_pseudocode.txt",'w',encoding='utf-8') as f:
         f.write("\n".join(final_lines))
-    print(f"[+] Псевдокод: {len(final_lines)} строк -> {args.out}_pseudocode.txt")
+    print(f"[+] Pseudocode: {len(final_lines)} lines -> {args.out}_pseudocode.txt")
 
-    print("[+] Структурирование if/while...")
+    print("[+] Structuring if/while...")
     main_structured = structure_pseudocode(main_lines)
     struct_parts = [main_structured]
     for t_rel, (sub_instrs, sub_lines) in sorted(processed_subs.items()):
@@ -1424,17 +1435,17 @@ def main():
         if name in defined_subs:
             return m.group(0)
         if name in opaque_names:
-            return (f"pass  # {name}() — нестандартный вызов (использует свой адрес "
-                    f"возврата как данные, не подчиняется call/ret; не разворачиваем)")
-        return f"pass  # {name}() — цель не удалось разобрать как подпрограмму (возможно, ложное срабатывание на данных)"
+            return (f"pass  # {name}() — non‑standard call (uses return address as data, "
+                    f"does not obey call/ret; not expanded)")
+        return f"pass  # {name}() — target could not be resolved as subroutine (possibly data)"
     structured = re.sub(r"(?<!def )(sub_0x[0-9a-f]+)\(\)", _fix_call, structured)
 
     with open(f"{args.out}_structured.py",'w',encoding='utf-8') as f:
         f.write(structured)
-    n_unresolved = structured.count('сложный переход') + structured.count('нераспознанный переход')
+    n_unresolved = structured.count('complex jump') + structured.count('unrecognised jump')
     n_total = len(structured.splitlines())
-    print(f"[+] Структурировано: {args.out}_structured.py ({n_total} строк, "
-          f"нераспознано переходов: {n_unresolved}, подпрограмм: {len(processed_subs)})")
+    print(f"[+] Structured: {args.out}_structured.py ({n_total} lines, "
+          f"unresolved jumps: {n_unresolved}, subroutines: {len(processed_subs)})")
     print("[+] Done.")
 
 if __name__=="__main__":

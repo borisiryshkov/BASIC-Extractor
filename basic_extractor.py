@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-basic_extractor.py (v3.6) — все сравнения теперь с правильным порядком операндов.
+basic_extractor.py (v3.9) — стабильная версия с правильными константами,
+нормализацией сравнений, списками переменных и констант.
 """
 import sys, struct, re, argparse, bisect
 from capstone import Cs, CS_ARCH_X86, CS_MODE_16
@@ -281,11 +282,15 @@ def reconstruct_conditions(instrs, data, str_seg_start, strcmp_target, floatcmp_
                 if op=="FLD":
                     stack_fpu.insert(0, sym(rest.split(" ",1)[1].strip()) if ("m32real" in rest or "m64real" in rest) else rest)
                 elif op in ("FSTP","FST"):
-                    if "ST(" in rest:
-                        k = int(re.search(r"ST\((\d+)\)", rest).group(1))
-                        if op=="FSTP": stack_fpu.pop(0)
-                        else: stack_fpu[k] = stack_fpu[0]
-                    elif op=="FSTP": stack_fpu.pop(0)
+                    match = re.search(r"ST\((\d+)\)", rest)
+                    if match:
+                        k = int(match.group(1))
+                        if op == "FSTP":
+                            stack_fpu.pop(0)          # FSTP ST(k) – pop с доп. копированием
+                        else:
+                            stack_fpu[k] = stack_fpu[0] # FST ST(k) – копирование без pop
+                    elif op == "FSTP":
+                        stack_fpu.pop(0)              # FSTP m32real и т.п. – просто снимаем ST(0)
                 elif op in ("FADD","FSUB","FMUL","FDIV","FSUBR","FDIVR"):
                     b = sym(rest.split(" ",1)[1].strip()) if ("m32real" in rest or "m64real" in rest) else rest
                     a = stack_fpu[0]
@@ -422,18 +427,18 @@ def reconstruct_conditions(instrs, data, str_seg_start, strcmp_target, floatcmp_
     return conditions
 
 # ================= 8. Поиск констант =================
-def lookup_var_value(var_name, data, str_seg_start, pstrings):
+def lookup_var_value(var_name, data, data_seg_start, pstrings):
     m = re.match(r"V_([0-9a-f]+)", var_name)
     if not m: return None
     off = int(m.group(1), 16)
-    f = read_const_float(data, str_seg_start, off)
+    f = read_const_float(data, data_seg_start, off)
     if f is not None and abs(f) > 1e-6:
         return f"{f:g}"
     return None
 
 # ================= 9. Псевдокод =================
 def build_pseudocode(instrs, pstrings, print_target, input_target, conditions,
-                     data, str_seg_start, print_num_target=None, seg_label="CODE",
+                     data, data_seg_start, print_num_target=None, seg_label="CODE",
                      code_start=0):
     call_re = re.compile(r"lcall (0x[0-9a-f]+), (0x[0-9a-f]+)")
     jump_re = re.compile(r"^(j[a-z]+)\s+(0x[0-9a-f]+)$")
@@ -617,6 +622,9 @@ def main():
     instrs = disasm_range(data, code_start, scan_end)
     print(f"[+] Инструкций: {len(instrs)}")
 
+    # ВАЖНО: сегмент данных совпадает со строковым сегментом
+    data_seg = str_seg
+
     print("[+] Автоопределение целей вызова...")
     print_t, input_t, strcmp_t, floatcmp_t = auto_detect_calls(instrs, pstrings, data, str_seg)
     print(f"    PRINT_TEXT: {print_t}   INPUT_READ: {input_t}")
@@ -632,10 +640,9 @@ def main():
         print(f"    PRINT_NUM (ручной): {print_num_t}")
 
     conditions = reconstruct_conditions(instrs, data, str_seg, strcmp_t, floatcmp_t)
-    print(f"[+] Условий восстановлено: {len(conditions)}")
 
     lines = build_pseudocode(instrs, pstrings, print_t, input_t, conditions,
-                             data, str_seg, print_num_target=print_num_t, code_start=code_start)
+                             data, data_seg, print_num_target=print_num_t, code_start=code_start)
 
     # --- ПОСТОБРАБОТКА КОНСТАНТ И ПЕРЕМЕННЫХ ---
     assigned_vars = set()
@@ -655,12 +662,12 @@ def main():
     const_defs = {}
     for var in const_candidates - assigned_vars:
         off = int(var[2:], 16)
-        f = read_const_float(data, str_seg, off)
+        f = read_const_float(data, data_seg, off)
         if f is not None:
             if abs(f) > 1e-12 and abs(f) < 1e12:
                 const_defs[var] = f"{f:g}"
         else:
-            i = read_const_uint16(data, str_seg, off)
+            i = read_const_uint16(data, data_seg, off)
             if i is not None and i != 0:
                 const_defs[var] = str(i)
 
@@ -684,22 +691,18 @@ def main():
                 rhs = rhs.strip()
                 if var not in variables:
                     val = None
-                    try:
-                        val = float(rhs)
-                    except ValueError:
-                        pass
+                    try: val = float(rhs)
+                    except ValueError: pass
                     if val is None:
                         m2 = re.fullmatch(r"V_[0-9a-f]+", rhs)
                         if m2:
                             ref_var = m2.group(0)
                             off = int(ref_var[2:], 16)
-                            f = read_const_float(data, str_seg, off)
-                            if f is not None:
-                                val = f
+                            f = read_const_float(data, data_seg, off)
+                            if f is not None: val = f
                             else:
-                                i = read_const_uint16(data, str_seg, off)
-                                if i is not None:
-                                    val = float(i)
+                                i = read_const_uint16(data, data_seg, off)
+                                if i is not None: val = float(i)
                     variables[var] = val
         idx_i = line.find("INPUT -> ")
         if idx_i != -1:
@@ -719,8 +722,7 @@ def main():
                 var_lines.append(f"; {var}")
         var_lines.append("; ---------------------")
 
-    # 3. КОРРЕКЦИЯ УСЛОВИЙ В СТРОКАХ ПСЕВДОКОДА
-    # Находим все строки с IF (...) GOTO и исправляем в них порядок операндов
+    # 3. Умная коррекция условий: перестановка, если константа слева
     new_lines = []
     for line in lines:
         m_if = re.match(r"^(CODE:\w+): IF \(([^)]+)\) GOTO (.+)$", line)
@@ -728,36 +730,23 @@ def main():
             addr = m_if.group(1)
             cond = m_if.group(2)
             goto = m_if.group(3)
-            # Заменяем имена констант на их значения
-            cond = re.sub(r"V_[0-9a-f]+", lambda m: const_defs.get(m.group(0), m.group(0)), cond)
-            # Если слева число, а справа переменная – меняем местами
-            m_flip = re.match(r"^([-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)\s*(==|!=|<=|>=|<|>)\s*(V_[0-9a-f]+|ARR_.*)$", cond)
-            if m_flip:
-                val, op, var = m_flip.group(1), m_flip.group(2), m_flip.group(3)
-                cond = f"{var} {op} {val}"
+            # Проверяем, не находится ли константа слева от оператора
+            m_op = re.search(r"\s*(==|!=|<=|>=|<|>)\s*", cond)
+            if m_op:
+                op = m_op.group(1)
+                left = cond[:m_op.start()].strip()
+                right = cond[m_op.end():].strip()
+                # Если левый операнд — константа, а правый — переменная, меняем местами
+                if left in const_defs and (right.startswith("V_") or right.startswith("ARR_")):
+                    left, right = right, left
+                    cond = f"{left} {op} {right}"
             new_lines.append(f"{addr}: IF ({cond}) GOTO {goto}")
         else:
             new_lines.append(line)
     lines = new_lines
 
-    # 4. Замена V_XXXX на значения во всём коде (кроме блоков констант/переменных и левых частей FORMULA/INPUT)
-    def replace_const(match):
-        var = match.group(0)
-        if var in const_defs:
-            return const_defs[var]
-        return var
-
-    final_lines = []
-    for line in lines:
-        if line.startswith("; -----") or line.startswith("; V_") or line.startswith("; ---"):
-            final_lines.append(line)
-        elif re.match(r"^\s*(FORMULA|INPUT ->)", line):
-            final_lines.append(line)
-        else:
-            new_line = re.sub(r"V_[0-9a-f]+", replace_const, line)
-            final_lines.append(new_line)
-
-    final_lines = const_lines + var_lines + final_lines
+    # 4. Финальный вывод: никакой замены V_ на числа не делаем!
+    final_lines = const_lines + var_lines + lines
 
     with open(f"{args.out}_pseudocode.txt",'w',encoding='utf-8') as f:
         f.write("\n".join(final_lines))

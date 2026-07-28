@@ -208,12 +208,6 @@ def auto_detect_calls(instrs, pstrings, data, str_seg_start):
         mc = LCALL_RE.match(mnem)                     # <-- новое RE
         is_jump = re.match(r"^(jmp|je|jne|jb|jbe|ja|jae|jl|jle|jg|jge|loop|jcxz|call)", mnem)
 
-        if not (m_ax or m_bx or is_push or mc or is_jump):
-            last_imm = None
-            pushes_since_call = []
-            last_mov_bx = None
-            continue
-
         if m_bx:
             last_mov_bx = int(m_bx.group(1),16)
             continue
@@ -279,6 +273,7 @@ def reconstruct_conditions(instrs, data, str_seg_start, strcmp_target, floatcmp_
     stack_fpu = []
     push_imm_hist = []
     last_imm = None
+    strcmp_literal_by_idx = {}  # idx перехода -> буква, с которой сравнивали (для OR-комбинаций типа N/n)
     i, n = 0, len(instrs)
     while i < n:
         off,kind,mnem,length,near,fa = instrs[i]
@@ -349,6 +344,7 @@ def reconstruct_conditions(instrs, data, str_seg_start, strcmp_target, floatcmp_
                         if jm and jm.group(1)!='jmp':
                             opy = JCC_MAP.get(jm.group(1),'?')
                             conditions[j] = f"input_str {opy} {lit!r}"
+                            strcmp_literal_by_idx[j] = lit
                             j+=1; continue
                         else: break
                 push_imm_hist = []
@@ -357,6 +353,38 @@ def reconstruct_conditions(instrs, data, str_seg_start, strcmp_target, floatcmp_
         if kind=='X86' and not re.match(r"^(mov|lea|push|pop|nop|xchg|call)", mnem):
             push_imm_hist = []
         i+=1
+
+    # --- Комбинация двух предыдущих строковых сравнений через OR
+    #     (идиома подтверждения ENTER/N, Y/y и т.п.):
+    #       dec ax
+    #       or ax, word ptr [bp - N]
+    #       and ax, ax
+    #       je/jne target
+    for idx in range(3, len(instrs)):
+        o0,k0,m0,_,_,_ = instrs[idx-3]
+        o1,k1,m1,_,_,_ = instrs[idx-2]
+        o2,k2,m2,_,_,_ = instrs[idx-1]
+        o3,k3,m3,_,_,_ = instrs[idx]
+        if not (k0==k1==k2==k3=='X86'): continue
+        if m0 != "dec ax": continue
+        if not re.match(r"or ax, word ptr \[bp", m1): continue
+        if m2 != "and ax, ax": continue
+        jm = jump_re.match(m3)
+        if not jm or jm.group(1)=='jmp': continue
+        jcc = jm.group(1)
+        # найти два предыдущих распознанных strcmp-сравнения (по возрастанию адреса, последние перед этим idx)
+        prior = sorted(k for k in strcmp_literal_by_idx if k < idx-3)
+        if len(prior) >= 2:
+            lit1 = strcmp_literal_by_idx[prior[-2]]
+            lit2 = strcmp_literal_by_idx[prior[-1]]
+            or_expr = f"input_str == {lit1!r} or input_str == {lit2!r}"
+            if jcc == 'je':
+                # je срабатывает, когда обе строки НЕ совпали
+                conditions[idx] = f"input_str != {lit1!r} and input_str != {lit2!r}"
+            elif jcc == 'jne':
+                # jne срабатывает, когда хотя бы одна строка совпала
+                conditions[idx] = f"input_str == {lit1!r} or input_str == {lit2!r}"
+            # для прочих jcc не трогаем — не должно встречаться для этой идиомы
 
     # Целочисленные cmp/test
     for idx in range(1, len(instrs)):
@@ -390,11 +418,61 @@ def lookup_var_value(var_name, data, str_seg_start, pstrings):
 
 # ================= 9. Псевдокод =================
 def build_pseudocode(instrs, pstrings, print_target, input_target, conditions,
-                     data, str_seg_start, print_num_target=None, seg_label="CODE"):
+                     data, str_seg_start, print_num_target=None, seg_label="CODE",
+                     code_start=0):
+    import bisect
     call_re = re.compile(r"lcall (0x[0-9a-f]+), (0x[0-9a-f]+)")
     jump_re = re.compile(r"^(j[a-z]+)\s+(0x[0-9a-f]+)$")
     last_imm = None; last_mov_bx = None; pending_push = None
     lines = []; stack_fpu = []
+
+    # --- ПЕРВЫЙ ПРОХОД: определить, на каких адресах вообще будет строка псевдокода
+    #     (нужно, чтобы GOTO мог "прилипнуть" к ближайшей РЕАЛЬНО существующей строке,
+    #     а не в пустоту между строк — адрес перехода часто указывает на служебную
+    #     инструкцию вроде "mov bx, imm", у которой своей строки нет)
+    emitted_addrs = []
+    _last_imm=None; _last_mov_bx=None; _pending_push=None
+    for idx,(off,kind,mnem,length,near,fa) in enumerate(instrs):
+        if kind=='X86':
+            m = re.match(r"mov bx, (0x[0-9a-f]+)$", mnem)
+            if m: _last_mov_bx = int(m.group(1),16)
+            m = re.match(r"mov (\w+), (0x[0-9a-f]+|\d+)$", mnem)
+            if m and m.group(1) in ('ax','bx','cx','dx'):
+                _last_imm = int(m.group(2),16) if m.group(2).startswith('0x') else int(m.group(2))
+                continue
+            m_push = re.match(r"push word ptr \[(0x[0-9a-f]+)\]", mnem)
+            if m_push: _pending_push = int(m_push.group(1),16); continue
+            if mnem.startswith("push ax") and _last_imm is not None:
+                _pending_push = _last_imm; continue
+            mc = call_re.match(mnem)
+            if mc:
+                tgt = (int(mc.group(1),16), int(mc.group(2),16))
+                if tgt == print_target and _pending_push in pstrings:
+                    emitted_addrs.append(off); _pending_push=None
+                elif tgt == input_target and (_last_mov_bx is not None or _pending_push is not None):
+                    emitted_addrs.append(off); _last_mov_bx=None; _pending_push=None
+                elif print_num_target is not None and tgt == print_num_target and _pending_push is not None:
+                    if _pending_push > 0xF and _pending_push not in pstrings:
+                        emitted_addrs.append(off)
+                    _pending_push=None
+                continue
+            if jump_re.match(mnem):
+                emitted_addrs.append(off); continue
+            if mnem.startswith("ret"):
+                emitted_addrs.append(off); continue
+        elif kind=='FPU':
+            parts = mnem.split(" ",1); op=parts[0]
+            if op in ("FSTP","FST"):
+                emitted_addrs.append(off)
+    emitted_addrs = sorted(set(emitted_addrs))
+
+    def snap(rel_addr):
+        """Ближайший СЛЕДУЮЩИЙ адрес (>=), на котором реально есть строка псевдокода."""
+        i = bisect.bisect_left(emitted_addrs, rel_addr)
+        if i < len(emitted_addrs):
+            return emitted_addrs[i]
+        return rel_addr  # конец диапазона — оставляем как есть
+
 
     # --- Сбор всех целей переходов ---
     jump_targets = set()
@@ -464,7 +542,10 @@ def build_pseudocode(instrs, pstrings, print_target, input_target, conditions,
                 continue
             mj = jump_re.match(mnem)
             if mj:
-                jcc, target = mj.group(1), int(mj.group(2),16)
+                jcc, target_abs = mj.group(1), int(mj.group(2),16)
+                target_rel = target_abs - code_start
+                target_snapped = snap(target_rel)
+                target_str = f"0x{target_snapped:04x}" + (f" (raw 0x{target_rel:04x})" if target_snapped != target_rel else "")
                 if idx in conditions:
                     cond = conditions[idx]
                     parts = cond.split(" ",2)
@@ -473,13 +554,13 @@ def build_pseudocode(instrs, pstrings, print_target, input_target, conditions,
                         left = format_operand(left)
                         right = format_operand(right)
                         cond = f"{left} {op} {right}"
-                    lines.append(f"{addr_s}: IF NOT ({cond}) GOTO 0x{target:04x}")
+                    lines.append(f"{addr_s}: IF ({cond}) GOTO {target_str}")
                     generated = True
                 else:
                     if jcc == 'jmp':
-                        lines.append(f"{addr_s}: jmp 0x{target:04x}")
+                        lines.append(f"{addr_s}: jmp {target_str}")
                     else:
-                        lines.append(f"{addr_s}: {jcc} 0x{target:04x}  [условие не распознано]")
+                        lines.append(f"{addr_s}: {jcc} {target_str}  [условие не распознано]")
                     generated = True
                 continue
             if mnem.startswith("ret"):
@@ -574,7 +655,7 @@ def main():
     print(f"[+] Условий восстановлено: {len(conditions)}")
 
     lines = build_pseudocode(instrs, pstrings, print_t, input_t, conditions,
-                             data, str_seg, print_num_target=print_num_t)
+                             data, str_seg, print_num_target=print_num_t, code_start=code_start)
     with open(f"{args.out}_pseudocode.txt",'w',encoding='utf-8') as f:
         f.write("\n".join(lines))
     print(f"[+] Псевдокод: {len(lines)} строк -> {args.out}_pseudocode.txt")

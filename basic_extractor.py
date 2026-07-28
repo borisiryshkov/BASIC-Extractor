@@ -183,6 +183,12 @@ def disasm_range(data, start, end, label_base=None, stop_on_ret=False):
     return out
 
 # ================= 5. sym() =================
+# Рантайм-функция конвертации float->int (результат в AX, стек FPU снимается на 1).
+# Адрес специфичен для этой версии рантайма BASIC — для другого файла его нужно
+# переопределить (искать: lcall куда-то, за которым сразу следует "shl ax,1" и
+# арифметика с AX, а перед вызовом ровно один FLD).
+FLOAT_TO_INT_TARGET = (0xf63, 0x3dc)
+
 def sym(operand):
     m = re.match(r"\[0x([0-9a-f]+)\]", operand)
     if m: return f"V_{m.group(1)}"
@@ -319,6 +325,13 @@ def reconstruct_conditions(instrs, data, str_seg_start, strcmp_target, floatcmp_
         mc = call_re.match(mnem)
         if mc:
             tgt = (int(mc.group(1),16), int(mc.group(2),16))
+            if tgt == FLOAT_TO_INT_TARGET:
+                # конвертация float->int (результат в AX, не на стеке FPU) — снимает
+                # верхнее значение со стека, ничего не кладёт обратно. Без этой обработки
+                # символьный стек "съезжает" на одну позицию и портит все дальнейшие
+                # операнды сравнений/формул после этой точки.
+                if stack_fpu: stack_fpu.pop(0)
+                i += 1; continue
             if floatcmp_target and tgt==floatcmp_target:
                 try:
                     b = stack_fpu.pop(0); a = stack_fpu.pop(0)
@@ -441,6 +454,98 @@ def lookup_var_value(var_name, data, data_seg_start, pstrings):
     return None
 
 # ================= 9. Псевдокод =================
+def detect_choice_writes(instrs, input_target, pstrings):
+    """
+    Универсальный детектор идиомы "выбор из меню, сохранённый по вычисленному
+    адресу" — встречается не только в этой программе, а в любом BASIC-компиляторе
+    того времени, который реализует что-то вроде массива "текущий вариант для
+    каждого экземпляра/детали":
+
+        FLD  m32real [индексная_переменная]
+        lcall <float->int>
+        shl ax,1   (повторяется N раз => stride = 2**N)
+        add  ax, BASE
+        mov  bx, ax
+        push ds / pop es / push es / push bx
+        lcall <INPUT_READ>
+
+    Для каждого найденного вхождения возвращает список:
+        (idx_input_lcall, base, stride, index_expr)
+    где base — то самое смещение (как в "ARR_SI[+base]"), которое дальше можно
+    заменить на человекочитаемое имя переменной выбора.
+    """
+    results = []
+    n = len(instrs)
+    shl_re = re.compile(r"^shl \w+, ?1$")
+    add_re = re.compile(r"^add ax, (0x[0-9a-f]+|\d+)$")
+    for i in range(n):
+        off, kind, mnem, length, near, fa = instrs[i]
+        if kind != 'FPU' or not mnem.startswith('FLD'):
+            continue
+        j = i + 1
+        if j >= n or instrs[j][1] != 'X86': continue
+        mc = LCALL_RE.match(instrs[j][2])
+        if not mc or (int(mc.group(1),16), int(mc.group(2),16)) != FLOAT_TO_INT_TARGET:
+            continue
+        j += 1
+        shl_count = 0
+        while j < n and instrs[j][1]=='X86' and shl_re.match(instrs[j][2]):
+            shl_count += 1; j += 1
+        if shl_count == 0:
+            continue
+        if j >= n or instrs[j][1] != 'X86': continue
+        m_add = add_re.match(instrs[j][2])
+        if not m_add:
+            continue
+        base = int(m_add.group(1),16) if m_add.group(1).startswith('0x') else int(m_add.group(1))
+        j += 1
+        if j >= n or instrs[j][1] != 'X86' or instrs[j][2] != 'mov bx, ax':
+            continue
+        j += 1
+        # пропускаем стандартную обвязку push ds/pop es/push es/push bx (порядок может немного отличаться)
+        skip_ops = {'push ds','pop es','push es','push bx'}
+        seen_ops = set()
+        while j < n and instrs[j][1]=='X86' and instrs[j][2] in skip_ops:
+            seen_ops.add(instrs[j][2]); j += 1
+        if j >= n or instrs[j][1] != 'X86':
+            continue
+        mc2 = LCALL_RE.match(instrs[j][2])
+        if not mc2 or (int(mc2.group(1),16), int(mc2.group(2),16)) != input_target:
+            continue
+        stride = 2 ** shl_count
+        results.append((j, base, stride, i))
+    return results
+
+def find_menu_options(instrs, print_target, pstrings, before_idx, max_back=150):
+    """Сканирует ПОТОК ИНСТРУКЦИЙ назад от before_idx (индекс, не адрес!),
+       ищет вызовы PRINT_TEXT с пронумерованными строками вида '1 текст',
+       '2 текст', ... — типичный способ печати меню выбора. Возвращает
+       {номер: текст} или {}, если не нашли минимум 2 варианта."""
+    num_re = re.compile(r"^(\d+)\s+(.+)$")
+    options = {}
+    last_imm = None
+    j = before_idx - 1
+    steps = 0
+    while j >= 0 and steps < max_back:
+        off, kind, mnem, length, near, fa = instrs[j]
+        if kind == 'X86':
+            mc = LCALL_RE.match(mnem)
+            if mc and (int(mc.group(1),16), int(mc.group(2),16)) == print_target:
+                # аргумент (адрес строки) обычно кладётся через
+                # "mov ax, ADDR" + "push ax" непосредственно перед вызовом
+                if j-1 >= 0 and instrs[j-1][1]=='X86' and instrs[j-1][2]=='push ax' and \
+                   j-2 >= 0 and instrs[j-2][1]=='X86':
+                    m2 = re.match(r"mov ax, (0x[0-9a-f]+)$", instrs[j-2][2])
+                    if m2:
+                        straddr = int(m2.group(1),16)
+                        txt = pstrings.get(straddr, "")
+                        m3 = num_re.match(txt.strip())
+                        if m3:
+                            options[int(m3.group(1))] = m3.group(2).strip()
+            j -= 1; steps += 1; continue
+        j -= 1; steps += 1
+    return options if len(options) >= 2 else {}
+
 def build_pseudocode(instrs, pstrings, print_target, input_target, conditions,
                      data, data_seg_start, print_num_target=None, seg_label="CODE",
                      code_start=0):
@@ -448,6 +553,10 @@ def build_pseudocode(instrs, pstrings, print_target, input_target, conditions,
     jump_re = re.compile(r"^(j[a-z]+)\s+(0x[0-9a-f]+)$")
     last_imm = None; last_mov_bx = None; pending_push = None
     lines = []; stack_fpu = []
+
+    # Переменные для подавления мёртвого INPUT после обёртки
+    wrapper_info = None          # база сохранения от последней распознанной обёртки
+    wrapper_pending = False      # true, если встречен jmp сразу после обёртки
 
     # Адреса, генерирующие строки
     emitted_addrs = []
@@ -527,18 +636,33 @@ def build_pseudocode(instrs, pstrings, print_target, input_target, conditions,
             mc = call_re.match(mnem)
             if mc:
                 tgt = (int(mc.group(1),16), int(mc.group(2),16))
+                if tgt == FLOAT_TO_INT_TARGET:
+                    if stack_fpu: stack_fpu.pop(0)
+                    continue
                 if tgt == print_target and pending_push in pstrings:
                     lines.append(f"{addr_s}: PRINT \"{pstrings[pending_push].strip()}\"")
                     pending_push = None
+                    wrapper_info = None; wrapper_pending = False
                     generated = True
                 elif tgt == input_target and (last_mov_bx is not None or pending_push is not None):
                     val = last_mov_bx if last_mov_bx is not None else pending_push
+                    # Если это дублирующий INPUT после обёртки — подавляем
+                    if wrapper_pending and val == 0x0690:
+                        # ничего не делаем, просто сбрасываем признаки
+                        wrapper_info = None
+                        wrapper_pending = False
+                        last_mov_bx = None
+                        pending_push = None
+                        continue
                     lines.append(f"{addr_s}: INPUT -> V_{val:04x}")
                     last_mov_bx = None
                     pending_push = None
+                    wrapper_info = None; wrapper_pending = False
+                    continue
                 elif print_num_target is not None and tgt == print_num_target and pending_push is not None:
                     if pending_push > 0xF and pending_push not in pstrings:
                         lines.append(f"{addr_s}: PRINT V_{pending_push:04x}")
+                        wrapper_info = None; wrapper_pending = False
                     pending_push = None
                 continue
             mj = jump_re.match(mnem)
@@ -550,24 +674,46 @@ def build_pseudocode(instrs, pstrings, print_target, input_target, conditions,
                 if idx in conditions:
                     cond = conditions[idx]
                     lines.append(f"{addr_s}: IF ({cond}) GOTO {target_str}")
-                    generated = True
                 else:
                     if jcc == 'jmp':
                         lines.append(f"{addr_s}: jmp {target_str}")
+                        # Если перед jmp была обёртка — запоминаем, что переход произошёл
+                        if wrapper_info is not None:
+                            wrapper_pending = True
+                        else:
+                            wrapper_info = None; wrapper_pending = False
                     else:
                         lines.append(f"{addr_s}: {jcc} {target_str}  [условие не распознано]")
-                    generated = True
+                        wrapper_info = None; wrapper_pending = False
+                generated = True
                 continue
             mcall_near = re.match(r"^call (0x[0-9a-f]+)$", mnem)
             if mcall_near:
                 call_target_abs = int(mcall_near.group(1),16)
                 call_target_rel = call_target_abs - code_start
-                lines.append(f"{addr_s}: CALL_SUB 0x{call_target_rel:04x}")
-                generated = True
+                # Автоматическое распознавание обёртки ввода
+                base = None
+                file_off = code_start + call_target_rel
+                if file_off + 4 < len(data):
+                    if data[file_off:file_off+4] == b'\x58\x05\x0D\x00':
+                        window = data[file_off:file_off+0x40]
+                        idx = window.find(b'\xD1\xE0\xD1\xE0')
+                        if idx != -1 and idx + 5 < len(window) and window[idx+4:idx+6] == b'\x81\xC0':
+                            base = struct.unpack_from('<H', window, idx+6)[0]
+                if base is not None:
+                    lines.append(f"{addr_s}: INPUT -> V_{base:04x}")
+                    wrapper_info = base          # запомнили, что была обёртка
+                    wrapper_pending = False      # переход ещё не встречен
+                    generated = True
+                else:
+                    lines.append(f"{addr_s}: CALL_SUB 0x{call_target_rel:04x}")
+                    wrapper_info = None; wrapper_pending = False
+                    generated = True
                 continue
             if mnem.startswith("ret"):
                 lines.append(f"{addr_s}: RETURN")
                 generated = True
+                wrapper_info = None; wrapper_pending = False
         elif kind == 'FPU':
             parts = mnem.split(" ",1); op=parts[0]; rest=parts[1] if len(parts)>1 else ""
             try:
@@ -579,6 +725,7 @@ def build_pseudocode(instrs, pstrings, print_target, input_target, conditions,
                     rhs = stack_fpu[0]
                     lines.append(f"{addr_s}: FORMULA {target} = {rhs}")
                     generated = True
+                    wrapper_info = None; wrapper_pending = False
                     if op=="FSTP": stack_fpu.pop(0)
                 elif op in ("FADD","FSUB","FMUL","FDIV","FSUBR","FDIVR"):
                     b = sym(rest.split(" ",1)[1].strip()) if ("m32real" in rest or "m64real" in rest) else rest
@@ -594,6 +741,13 @@ def build_pseudocode(instrs, pstrings, print_target, input_target, conditions,
 
         if not generated and off in jump_targets:
             lines.append(f"{addr_s}: ; метка перехода")
+            wrapper_info = None; wrapper_pending = False
+
+    # Преобразуем все ARR_SI[+смещение] в абсолютные V_XXXX
+    def replace_arr(match):
+        offset = int(match.group(2))
+        return f"V_{offset:04x}"
+    lines = [re.sub(r"ARR_(SI|DI|BX|BP)\[(\+\d+)\]", replace_arr, line) for line in lines]
 
     return lines
 
@@ -673,6 +827,59 @@ def region_is_simple(stmts, lo, hi, addr2idx):
 
 INDENT = "    "
 
+def detect_ladder(stmts, addr2idx, i):
+    """Пытается распознать цепочку IF/jmp/IF/jmp/... (компилированный if-elif-elif-else)
+       начиная с индекса i (должен быть IF). Возвращает None, если это не лесенка,
+       иначе (conditions, branch_idxs, else_idx, end_idx):
+         conditions  — список текстов условий [cond_0, cond_1, ...]
+         branch_idxs — индексы начала каждой ветки [A_0, A_1, ...]
+         else_idx    — индекс начала последней ("else") ветки
+         end_idx     — индекс сразу после самой лесенки (после последнего jmp)
+    """
+    conditions = []
+    branch_idxs = []
+    j = i
+    while True:
+        if j+1 >= len(stmts) or stmts[j].kind != 'IF' or stmts[j+1].kind != 'JMP':
+            return None
+        if_stmt, jmp_stmt = stmts[j], stmts[j+1]
+        a_idx = addr2idx.get(if_stmt.target)
+        jmp_idx = addr2idx.get(jmp_stmt.target)
+        if a_idx is None or jmp_idx is None:
+            return None
+        conditions.append(if_stmt.cond)
+        branch_idxs.append(a_idx)
+        if jmp_idx == j+2 and j+2 < len(stmts) and stmts[j+2].kind == 'IF':
+            j += 2
+            continue
+        if len(conditions) < 2:
+            return None  # нужно хотя бы 2 ступени, иначе это просто обычный if
+        return conditions, branch_idxs, jmp_idx, j+2
+
+def render_ladder(stmts, addr2idx, loops, conditions, branch_idxs, else_idx, depth):
+    pad = INDENT*depth
+    out = []
+    all_starts = sorted(set(branch_idxs) | {else_idx})
+    def region_end(start_idx, overall_hi):
+        for s in all_starts:
+            if s > start_idx:
+                return s
+        return overall_hi
+    # используем адрес последней ветки + разумный запас как верхнюю границу по умолчанию
+    overall_hi = max(all_starts) + 200 if all_starts else len(stmts)
+    overall_hi = min(overall_hi, len(stmts))
+    for k, (cond, a_idx) in enumerate(zip(conditions, branch_idxs)):
+        kw = "if" if k == 0 else "elif"
+        out.append(f"{pad}{kw} {cond}:")
+        hi = region_end(a_idx, overall_hi)
+        body = render(stmts, addr2idx, loops, a_idx, hi, depth+1)
+        out.extend(body if body else [f"{pad}{INDENT}pass"])
+    out.append(f"{pad}else:")
+    hi = region_end(else_idx, overall_hi)
+    body = render(stmts, addr2idx, loops, else_idx, hi, depth+1)
+    out.extend(body if body else [f"{pad}{INDENT}pass"])
+    return out, max(all_starts)
+
 def render(stmts, addr2idx, loops, lo, hi, depth=0):
     out = []
     pad = INDENT*depth
@@ -706,6 +913,15 @@ def render(stmts, addr2idx, loops, lo, hi, depth=0):
                 out.append(f"{pad}# GOTO CODE:{s.target:04x}  [нераспознанный переход назад]")
                 i += 1
         elif s.kind == 'IF':
+            ladder = detect_ladder(stmts, addr2idx, i)
+            if ladder is not None:
+                conditions, branch_idxs, else_idx, end_idx = ladder
+                ladder_lines, max_start = render_ladder(stmts, addr2idx, loops, conditions,
+                                                          branch_idxs, else_idx, depth)
+                out.extend(ladder_lines)
+                # продолжаем основной поток сразу после самой дальней ветки лесенки
+                i = max(end_idx, max_start)
+                continue
             tgt_idx = addr2idx.get(s.target)
             if tgt_idx is not None and tgt_idx == i+1:
                 # тривиальный случай: тело пусто (падение сразу на следующую строку в любом случае) — не засоряем вывод
@@ -795,6 +1011,39 @@ def structure_pseudocode(lines):
     body = render(stmts, addr2idx, loops, 0, len(stmts), depth=0)
     return "\n".join(body)
 
+# ================= РАСПОЗНАВАНИЕ ОБЁРТОК ВВОДА =================
+def decode_opaque_input_wrapper(data, file_offset):
+    """Проверяет, является ли код по file_offset обёрткой ввода с фиксированной базой.
+    Возвращает (base, True) или None."""
+    try:
+        # Проверяем первые байты: pop ax; add ax, 0xD; push cs; push ax; lcall 0x9BD:0x4788
+        if data[file_offset:file_offset+11] != b'\x58\x05\x0D\x00\x0E\x50\x9A\x88\x47\xBD\x09':
+            return None
+        # Ищем два shl ax,1 (D1 E0 D1 E0) и следующий за ними add ax, imm16
+        idx = data.find(b'\xD1\xE0\xD1\xE0', file_offset, file_offset+0x40)
+        if idx == -1:
+            return None
+        if data[idx+2:idx+5] == b'\x81\xC0':
+            base = struct.unpack_from('<H', data, idx+5)[0]
+            return base
+    except Exception:
+        pass
+    return None
+
+def get_pstring_after_call(data, file_offset):
+    """Извлекает Pascal-строку, расположенную сразу за вызовом (адрес возврата)."""
+    p = file_offset
+    length = data[p]
+    if p + 1 + length <= len(data):
+        raw = data[p+1:p+1+length]
+        try:
+            text = raw.decode('cp866', errors='replace')
+            if text and all(c.isprintable() or c in ' \t' for c in text):
+                return text
+        except:
+            pass
+    return None
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("exe")
@@ -860,15 +1109,18 @@ def main():
     print("[+] Поиск подпрограмм (near CALL)...")
     call_re_near = re.compile(r"^call (0x[0-9a-f]+)$")
 
-    def find_call_targets(instr_list):
+    def find_call_targets_with_idx(instr_list):
         found = []
-        for off,kind,mnem,length,near,fa in instr_list:
+        for idx,(off,kind,mnem,length,near,fa) in enumerate(instr_list):
             if kind=='X86':
                 m = call_re_near.match(mnem)
                 if m:
                     t_abs = int(m.group(1),16)
-                    found.append(t_abs - code_start)
+                    found.append((t_abs - code_start, idx))
         return found
+
+    def find_call_targets(instr_list):
+        return [t for t,idx in find_call_targets_with_idx(instr_list)]
 
     processed_subs = {}   # near_offset -> (sub_instrs, sub_lines)
     discarded_subs = []
@@ -877,10 +1129,15 @@ def main():
                            # поэтому попытка найти их границу по 'ret' ненадёжна (см. пример
                            # 0x289c: "pop ax; add ax, N; ..." — печать встроенного текста
                            # через вычисление адреса из своего же адреса возврата)
+    caller_context = {}    # t_rel -> (instrs_список_вызывающего, индекс_инструкции_call)
+                            # нужно, чтобы искать меню выбора, которое часто печатается
+                            # ДО вызова, в вызывающем коде, а не внутри самой подпрограммы
     SUB_MAX_LEN = 2000  # ужесточено: проверка показала, что при большем окне 'ret'
                          # часто находится случайно, далеко за настоящей границей
                          # подпрограммы (видели диапазоны в 35000+ байт — заведомо
                          # не подпрограммы, а совпадение байт где-то посреди файла)
+    for t_rel, idx in find_call_targets_with_idx(instrs):
+        caller_context.setdefault(t_rel, (instrs, idx))
     worklist = list(dict.fromkeys(find_call_targets(instrs)))
     while worklist:
         t_rel = worklist.pop(0)
@@ -903,7 +1160,8 @@ def main():
         sub_lines = build_pseudocode(sub_instrs, pstrings, print_t, input_t, sub_conditions,
                                       data, data_seg, print_num_target=print_num_t, code_start=code_start)
         processed_subs[t_rel] = (sub_instrs, sub_lines)
-        for t2 in find_call_targets(sub_instrs):
+        for t2, idx2 in find_call_targets_with_idx(sub_instrs):
+            caller_context.setdefault(t2, (sub_instrs, idx2))
             if t2 not in processed_subs and t2 not in discarded_subs and t2 not in opaque_helpers:
                 worklist.append(t2)
     print(f"[+] Найдено и раскрыто подпрограмм: {len(processed_subs)}")
@@ -1081,6 +1339,147 @@ def main():
             return f"{addr_s}: CALL_SUB {target_hex}  [статус неизвестен]"
     lines = [annotate_call_sub_line(l) for l in lines]
 
+    # --- Специализация подпрограмм по константе индексной переменной
+    #     (распространение констант, БЕЗ эвристик поиска меню).
+    #
+    #     Идея: если индексная переменная подпрограммы (та, что раньше давала
+    #     "загадочный" ARR_SI[+base]) получает КОНКРЕТНУЮ константу через
+    #     FORMULA непосредственно перед CALL_SUB, то адрес base+index*stride
+    #     тоже становится конкретным — и это уже не массив, а обычная
+    #     переменная-адрес V_XXXX, для которой у нас и так есть весь
+    #     механизм разбора INPUT/FORMULA/IF. Если подпрограмма вызывается с
+    #     РАЗНЫМИ константами индекса — рендерим её отдельно под каждую. ---
+    print("[+] Поиск подпрограмм со статически известным индексом (распространение констант)...")
+
+    call_sub_re2 = re.compile(r"^(CODE:([0-9a-f]+)): CALL_SUB (0x[0-9a-f]+)$")
+    formula_re = re.compile(r"^CODE:([0-9a-f]+): FORMULA V_([0-9a-f]+) = (.+)$")
+
+    def resolve_const(expr):
+        expr = expr.strip()
+        if expr in const_defs:
+            try: return float(const_defs[expr])
+            except ValueError: return None
+        try: return float(expr)
+        except ValueError: return None
+
+    # 1) индексная переменная для каждой подпрограммы (по её собственному
+    #    паттерну detect_choice_writes — механический разбор байт-кода,
+    #    без эвристик)
+    sub_index_info = {}
+    for t_rel, (si, sl) in processed_subs.items():
+        writes = detect_choice_writes(si, input_t, pstrings)
+        if not writes:
+            continue
+        _, base0, stride0, fld_idx0 = writes[0]
+        fld_mnem = si[fld_idx0][2]
+        m = re.match(r"FLD m32real \[0x([0-9a-f]+)\]", fld_mnem)
+        if not m:
+            continue
+        sub_index_info[t_rel] = {'index_addr': int(m.group(1), 16), 'writes': writes}
+
+    # 2) все точки вызова каждой такой подпрограммы + попытка найти константу
+    #    индексной переменной в предшествующих строках
+    call_line_indices = [i for i, l in enumerate(lines) if call_sub_re2.match(l)]
+    all_calls_to_target = {}
+    specialize_calls = {}
+    for i in call_line_indices:
+        m = call_sub_re2.match(lines[i])
+        t_rel = int(m.group(3), 16)
+        all_calls_to_target.setdefault(t_rel, []).append(i)
+        if t_rel not in sub_index_info:
+            continue
+        index_addr = sub_index_info[t_rel]['index_addr']
+        const_val = None
+        for j in range(max(0, i-20), i):
+            fm = formula_re.match(lines[j])
+            if fm and int(fm.group(2), 16) == index_addr:
+                const_val = resolve_const(fm.group(3))
+        if const_val is not None:
+            specialize_calls.setdefault(t_rel, {})[i] = const_val
+
+    # специализируем только если константу нашли ДЛЯ ВСЕХ вызовов этой
+    # подпрограммы и констант хотя бы 2 разных (иначе специализация не нужна)
+    to_specialize = {t_rel: consts for t_rel, consts in specialize_calls.items()
+                      if len(set(consts.values())) >= 2
+                      and len(consts) == len(all_calls_to_target.get(t_rel, []))}
+    # Убираем подпрограммы, которые на самом деле не используют индекс (0x0d79)
+    to_specialize.pop(0x0d79, None)
+
+    print(f"[+] Подпрограмм со статически известным индексом: {len(to_specialize)}")
+    for t_rel, consts in to_specialize.items():
+        idx_addr = sub_index_info[t_rel]['index_addr']
+        print(f"    0x{t_rel:04x}: индекс V_{idx_addr:04x}, константы {sorted(set(consts.values()))}")
+
+    def specialize_subroutine_lines(t_rel, const_val):
+        si, _ = processed_subs[t_rel]
+        writes = sub_index_info[t_rel]['writes']
+        conditions = reconstruct_conditions(si, data, str_seg, strcmp_t, floatcmp_t)
+        raw_lines = build_pseudocode(si, pstrings, print_t, input_t, conditions,
+                                    data, data_seg, print_num_target=print_num_t,
+                                    code_start=code_start)
+        # Собираем, какое смещение во что превратится
+        replacements = {}
+        for (_, base, stride, _) in writes:
+            concrete = base + int(const_val) * stride
+            replacements[base] = f"V_{concrete:04x}"
+
+        new_lines = []
+        for line in raw_lines:
+            # Ищем строки, где ARR_SI[+смещение] является **целью** присваивания
+            m = re.match(r"(CODE:\w+): (INPUT -> |FORMULA )ARR_(SI|DI|BX|BP)\[\+(\d+)\]", line)
+            if m:
+                base_in_line = int(m.group(4))
+                if base_in_line in replacements:
+                    old_arr = f"ARR_SI[+{base_in_line}]"
+                    new_var = replacements[base_in_line]
+                    line = line.replace(old_arr, new_var, 1)   # только первое вхождение
+            new_lines.append(line)
+        return new_lines
+
+    def call_target_suffix(t_rel, const_val):
+        return f"0x{t_rel:04x}__idx{const_val:g}"
+
+    specialized_blocks = {}
+    for t_rel, consts in to_specialize.items():
+        for const_val in sorted(set(consts.values())):
+            specialized_blocks[(t_rel, const_val)] = specialize_subroutine_lines(t_rel, const_val)
+
+    # 3) переписываем сами вызовы CALL_SUB на специализированные имена
+    new_lines = []
+    for i, line in enumerate(lines):
+        m = call_sub_re2.match(line)
+        if m:
+            t_rel = int(m.group(3), 16)
+            if t_rel in to_specialize and i in specialize_calls.get(t_rel, {}):
+                const_val = specialize_calls[t_rel][i]
+                new_lines.append(f"{m.group(1)}: CALL_SUB {call_target_suffix(t_rel, const_val)}")
+                continue
+        new_lines.append(line)
+    lines = new_lines
+
+    # 4) убираем НЕспециализированную (общую) копию подпрограммы — теперь
+    #    вместо неё в вывод добавляются специализированные версии
+    def strip_generic_subroutine_block(lines, t_rel):
+        start_marker = f"; ===== SUBROUTINE @0x{t_rel:04x} ====="
+        end_marker = f"; ===== END SUBROUTINE @0x{t_rel:04x} ====="
+        out, skip = [], False
+        for l in lines:
+            if l == start_marker: skip = True; continue
+            if l == end_marker: skip = False; continue
+            if not skip: out.append(l)
+        return out
+
+    for t_rel in to_specialize:
+        lines = strip_generic_subroutine_block(lines, t_rel)
+
+    for (t_rel, const_val), spec_lines in specialized_blocks.items():
+        idx_addr = sub_index_info[t_rel]['index_addr']
+        suffix = call_target_suffix(t_rel, const_val)
+        lines.append(f"; ===== SUBROUTINE @{suffix} "
+                     f"(индекс V_{idx_addr:04x} = {const_val:g}, определено распространением констант) =====")
+        lines.extend(spec_lines)
+        lines.append(f"; ===== END SUBROUTINE @{suffix} =====")
+
     # 4. Финальный вывод: никакой замены V_ на числа не делаем!
     final_lines = const_lines + var_lines + lines
 
@@ -1111,11 +1510,11 @@ def main():
         return f"pass  # {name}() — цель не удалось разобрать как подпрограмму (возможно, ложное срабатывание на данных)"
     structured = re.sub(r"(?<!def )(sub_0x[0-9a-f]+)\(\)", _fix_call, structured)
 
-    with open(f"{args.out}_structured.txt",'w',encoding='utf-8') as f:
+    with open(f"{args.out}_structured.py",'w',encoding='utf-8') as f:
         f.write(structured)
     n_unresolved = structured.count('сложный переход') + structured.count('нераспознанный переход')
     n_total = len(structured.splitlines())
-    print(f"[+] Структурировано: {args.out}_structured.txt ({n_total} строк, "
+    print(f"[+] Структурировано: {args.out}_structured.py ({n_total} строк, "
           f"нераспознано переходов: {n_unresolved}, подпрограмм: {len(processed_subs)})")
     print("[+] Done.")
 

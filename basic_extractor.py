@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-basic_extractor.py (v3.4) — полная версия с ручным указанием print-числа
+basic_extractor.py (v3.6) — все сравнения теперь с правильным порядком операндов.
 """
-import sys, struct, re, argparse
+import sys, struct, re, argparse, bisect
 from capstone import Cs, CS_ARCH_X86, CS_MODE_16
 
 # ================= 1. MZ header =================
@@ -205,7 +205,7 @@ def auto_detect_calls(instrs, pstrings, data, str_seg_start):
         m_ax = mov_ax_re.match(mnem)
         m_bx = mov_bx_re.match(mnem)
         is_push = push_imm_re.match(mnem)
-        mc = LCALL_RE.match(mnem)                     # <-- новое RE
+        mc = LCALL_RE.match(mnem)
         is_jump = re.match(r"^(jmp|je|jne|jb|jbe|ja|jae|jl|jle|jg|jge|loop|jcxz|call)", mnem)
 
         if m_bx:
@@ -238,7 +238,6 @@ def auto_detect_calls(instrs, pstrings, data, str_seg_start):
         if is_jump:
             continue
 
-    # Второй проход для float-compare
     for idx in range(2, len(instrs)-1):
         off,kind,mnem,length,near,fa = instrs[idx]
         if kind=='X86' and mnem.startswith('int '):
@@ -264,7 +263,6 @@ def parse_cmp_operands(mnem):
     return None, None, None
 
 def reconstruct_conditions(instrs, data, str_seg_start, strcmp_target, floatcmp_target):
-    # Аналогично заменим call_re на LCALL_RE
     call_re = LCALL_RE
     jump_re = re.compile(r"^(j[a-z]+)\s+(0x[0-9a-f]+)$")
     conditions = {}
@@ -273,7 +271,7 @@ def reconstruct_conditions(instrs, data, str_seg_start, strcmp_target, floatcmp_
     stack_fpu = []
     push_imm_hist = []
     last_imm = None
-    strcmp_literal_by_idx = {}  # idx перехода -> буква, с которой сравнивали (для OR-комбинаций типа N/n)
+    strcmp_literal_by_idx = {}
     i, n = 0, len(instrs)
     while i < n:
         off,kind,mnem,length,near,fa = instrs[i]
@@ -354,12 +352,7 @@ def reconstruct_conditions(instrs, data, str_seg_start, strcmp_target, floatcmp_
             push_imm_hist = []
         i+=1
 
-    # --- Комбинация двух предыдущих строковых сравнений через OR
-    #     (идиома подтверждения ENTER/N, Y/y и т.п.):
-    #       dec ax
-    #       or ax, word ptr [bp - N]
-    #       and ax, ax
-    #       je/jne target
+    # OR-комбинации strcmp
     for idx in range(3, len(instrs)):
         o0,k0,m0,_,_,_ = instrs[idx-3]
         o1,k1,m1,_,_,_ = instrs[idx-2]
@@ -372,21 +365,29 @@ def reconstruct_conditions(instrs, data, str_seg_start, strcmp_target, floatcmp_
         jm = jump_re.match(m3)
         if not jm or jm.group(1)=='jmp': continue
         jcc = jm.group(1)
-        # найти два предыдущих распознанных strcmp-сравнения (по возрастанию адреса, последние перед этим idx)
         prior = sorted(k for k in strcmp_literal_by_idx if k < idx-3)
         if len(prior) >= 2:
             lit1 = strcmp_literal_by_idx[prior[-2]]
             lit2 = strcmp_literal_by_idx[prior[-1]]
-            or_expr = f"input_str == {lit1!r} or input_str == {lit2!r}"
             if jcc == 'je':
-                # je срабатывает, когда обе строки НЕ совпали
                 conditions[idx] = f"input_str != {lit1!r} and input_str != {lit2!r}"
             elif jcc == 'jne':
-                # jne срабатывает, когда хотя бы одна строка совпала
                 conditions[idx] = f"input_str == {lit1!r} or input_str == {lit2!r}"
-            # для прочих jcc не трогаем — не должно встречаться для этой идиомы
 
-    # Целочисленные cmp/test
+    # Целочисленные cmp/test с нормализацией
+    def resolve_operand(op_str):
+        if op_str is None:
+            return None
+        if re.match(r'^0x[0-9a-f]+$', op_str):
+            return str(int(op_str, 16))
+        m = re.match(r'(?:word|dword)\s*ptr\s*\[(0x[0-9a-f]+)\]', op_str)
+        if m:
+            return f"V_{m.group(1)}"
+        m = re.match(r'\[(0x[0-9a-f]+)\]', op_str)
+        if m:
+            return f"V_{m.group(1)}"
+        return sym(op_str)
+
     for idx in range(1, len(instrs)):
         _,k1,m1,_,_,_ = instrs[idx-1]
         _,k2,m2,_,_,_ = instrs[idx]
@@ -399,11 +400,25 @@ def reconstruct_conditions(instrs, data, str_seg_start, strcmp_target, floatcmp_
         jcc = jm.group(1)
         op = JCC_MAP.get(jcc)
         if not op: continue
+
+        left_sym = resolve_operand(left)
+        right_sym = resolve_operand(right)
+
+        # нормализуем: переменная должна быть слева
+        if left_sym is not None and right_sym is not None:
+            left_is_var = left_sym.startswith("V_") or left_sym.startswith("ARR_")
+            right_is_var = right_sym.startswith("V_") or right_sym.startswith("ARR_")
+            if not left_is_var and right_is_var:
+                left_sym, right_sym = right_sym, left_sym
+
         if is_test:
-            if left == right: conditions[idx] = f"{left} {op} 0"
-            else: conditions[idx] = f"({left} & {right}) {op} 0"
+            if left_sym == right_sym:
+                conditions[idx] = f"{left_sym} {op} 0"
+            else:
+                conditions[idx] = f"({left_sym} & {right_sym}) {op} 0"
         else:
-            conditions[idx] = f"{left} {op} {right}"
+            conditions[idx] = f"{left_sym} {op} {right_sym}"
+
     return conditions
 
 # ================= 8. Поиск констант =================
@@ -420,16 +435,12 @@ def lookup_var_value(var_name, data, str_seg_start, pstrings):
 def build_pseudocode(instrs, pstrings, print_target, input_target, conditions,
                      data, str_seg_start, print_num_target=None, seg_label="CODE",
                      code_start=0):
-    import bisect
     call_re = re.compile(r"lcall (0x[0-9a-f]+), (0x[0-9a-f]+)")
     jump_re = re.compile(r"^(j[a-z]+)\s+(0x[0-9a-f]+)$")
     last_imm = None; last_mov_bx = None; pending_push = None
     lines = []; stack_fpu = []
 
-    # --- ПЕРВЫЙ ПРОХОД: определить, на каких адресах вообще будет строка псевдокода
-    #     (нужно, чтобы GOTO мог "прилипнуть" к ближайшей РЕАЛЬНО существующей строке,
-    #     а не в пустоту между строк — адрес перехода часто указывает на служебную
-    #     инструкцию вроде "mov bx, imm", у которой своей строки нет)
+    # Адреса, генерирующие строки
     emitted_addrs = []
     _last_imm=None; _last_mov_bx=None; _pending_push=None
     for idx,(off,kind,mnem,length,near,fa) in enumerate(instrs):
@@ -467,42 +478,27 @@ def build_pseudocode(instrs, pstrings, print_target, input_target, conditions,
     emitted_addrs = sorted(set(emitted_addrs))
 
     def snap(rel_addr):
-        """Ближайший СЛЕДУЮЩИЙ адрес (>=), на котором реально есть строка псевдокода."""
         i = bisect.bisect_left(emitted_addrs, rel_addr)
         if i < len(emitted_addrs):
             return emitted_addrs[i]
-        return rel_addr  # конец диапазона — оставляем как есть
+        return rel_addr
 
-
-    # --- Сбор всех целей переходов ---
+    # Сбор целей переходов
     jump_targets = set()
     for idx, (off, kind, mnem, length, near, fa) in enumerate(instrs):
         if kind != 'X86': continue
-        # безусловные jmp
         if mnem.startswith('jmp'):
             m = re.match(r"jmp\s+(0x[0-9a-f]+)", mnem)
             if m: jump_targets.add(int(m.group(1), 16))
-        # условные jcc
         mj = jump_re.match(mnem)
         if mj and mj.group(1) != 'jmp':
             target = int(mj.group(2), 16)
-            if idx in conditions:
-                # IF NOT ... GOTO – цель тоже добавляем
-                jump_targets.add(target)
-            else:
-                # нераспознанный jcc – всё равно цель
-                jump_targets.add(target)
-        # также lcall? не обязательно.
+            jump_targets.add(target)
 
-    def format_operand(op):
-        if op.startswith("V_"):
-            val = lookup_var_value(op, data, str_seg_start, pstrings)
-            if val: return val
-        return op
-
+    # Генерация строк
     for idx,(off,kind,mnem,length,near,fa) in enumerate(instrs):
         addr_s = f"{seg_label}:{off:04x}"
-        generated = False   # была ли сгенерирована строка для этого адреса
+        generated = False
 
         if kind == 'X86':
             m = re.match(r"mov bx, (0x[0-9a-f]+)$", mnem)
@@ -511,7 +507,6 @@ def build_pseudocode(instrs, pstrings, print_target, input_target, conditions,
             if m and m.group(1) in ('ax','bx','cx','dx'):
                 last_imm = int(m.group(2),16) if m.group(2).startswith('0x') else int(m.group(2))
                 continue
-            # прямой push word ptr [0x…]
             m_push = re.match(r"push word ptr \[(0x[0-9a-f]+)\]", mnem)
             if m_push:
                 pending_push = int(m_push.group(1), 16)
@@ -534,11 +529,6 @@ def build_pseudocode(instrs, pstrings, print_target, input_target, conditions,
                     if pending_push > 0xF and pending_push not in pstrings:
                         lines.append(f"{addr_s}: PRINT V_{pending_push:04x}")
                     pending_push = None
-                elif print_num_target is not None and tgt == print_num_target and pending_push is not None:
-                    if pending_push > 0xF and pending_push not in pstrings:
-                        lines.append(f"{addr_s}: PRINT V_{pending_push:04x}")
-                    pending_push = None
-                    generated = True
                 continue
             mj = jump_re.match(mnem)
             if mj:
@@ -548,12 +538,6 @@ def build_pseudocode(instrs, pstrings, print_target, input_target, conditions,
                 target_str = f"0x{target_snapped:04x}" + (f" (raw 0x{target_rel:04x})" if target_snapped != target_rel else "")
                 if idx in conditions:
                     cond = conditions[idx]
-                    parts = cond.split(" ",2)
-                    if len(parts)>=3:
-                        left, op, right = parts[0], parts[1], parts[2]
-                        left = format_operand(left)
-                        right = format_operand(right)
-                        cond = f"{left} {op} {right}"
                     lines.append(f"{addr_s}: IF ({cond}) GOTO {target_str}")
                     generated = True
                 else:
@@ -575,9 +559,7 @@ def build_pseudocode(instrs, pstrings, print_target, input_target, conditions,
                 elif op in ("FSTP","FST"):
                     target = sym(rest.split(" ",1)[-1].strip())
                     rhs = stack_fpu[0]
-                    target_disp = format_operand(target)
-                    rhs_disp = format_operand(rhs)
-                    lines.append(f"{addr_s}: FORMULA {target_disp} = {rhs_disp}")
+                    lines.append(f"{addr_s}: FORMULA {target} = {rhs}")
                     generated = True
                     if op=="FSTP": stack_fpu.pop(0)
                 elif op in ("FADD","FSUB","FMUL","FDIV","FSUBR","FDIVR"):
@@ -592,7 +574,6 @@ def build_pseudocode(instrs, pstrings, print_target, input_target, conditions,
                 stack_fpu = []
             continue
 
-        # Если для данного адреса не сгенерировано строки, но он является целью перехода – вставим метку
         if not generated and off in jump_targets:
             lines.append(f"{addr_s}: ; метка перехода")
 
@@ -641,7 +622,6 @@ def main():
     print(f"    PRINT_TEXT: {print_t}   INPUT_READ: {input_t}")
     print(f"    STRCMP: {strcmp_t}   FLOAT_COMPARE_HELPER: {floatcmp_t}")
 
-    input_t = input_t   # из auto_detect_calls
     if args.input_seg is not None and args.input_off is not None:
         input_t = (args.input_seg, args.input_off)
         print(f"    INPUT_READ (ручной): {input_t}")
@@ -656,9 +636,132 @@ def main():
 
     lines = build_pseudocode(instrs, pstrings, print_t, input_t, conditions,
                              data, str_seg, print_num_target=print_num_t, code_start=code_start)
+
+    # --- ПОСТОБРАБОТКА КОНСТАНТ И ПЕРЕМЕННЫХ ---
+    assigned_vars = set()
+    for line in lines:
+        if line.lstrip().startswith("FORMULA "):
+            m = re.match(r"\s*FORMULA (V_[0-9a-f]+) =", line)
+            if m: assigned_vars.add(m.group(1))
+        elif line.lstrip().startswith("INPUT -> "):
+            m = re.match(r"\s*INPUT -> (V_[0-9a-f]+)", line)
+            if m: assigned_vars.add(m.group(1))
+
+    const_candidates = set()
+    for line in lines:
+        for match in re.finditer(r"V_[0-9a-f]+", line):
+            const_candidates.add(match.group(0))
+
+    const_defs = {}
+    for var in const_candidates - assigned_vars:
+        off = int(var[2:], 16)
+        f = read_const_float(data, str_seg, off)
+        if f is not None:
+            if abs(f) > 1e-12 and abs(f) < 1e12:
+                const_defs[var] = f"{f:g}"
+        else:
+            i = read_const_uint16(data, str_seg, off)
+            if i is not None and i != 0:
+                const_defs[var] = str(i)
+
+    # 1. Блок констант
+    const_lines = []
+    if const_defs:
+        const_lines = ["; ----- CONSTANTS -----"]
+        for var, val in sorted(const_defs.items(), key=lambda x: int(x[0][2:],16)):
+            const_lines.append(f"; {var} = {val}")
+        const_lines.append("; ---------------------")
+
+    # 2. Собираем переменные
+    variables = {}
+    for line in lines:
+        idx_f = line.find("FORMULA ")
+        if idx_f != -1:
+            rest = line[idx_f+len("FORMULA "):].strip()
+            if " = " in rest:
+                var, rhs = rest.split(" = ", 1)
+                var = var.strip()
+                rhs = rhs.strip()
+                if var not in variables:
+                    val = None
+                    try:
+                        val = float(rhs)
+                    except ValueError:
+                        pass
+                    if val is None:
+                        m2 = re.fullmatch(r"V_[0-9a-f]+", rhs)
+                        if m2:
+                            ref_var = m2.group(0)
+                            off = int(ref_var[2:], 16)
+                            f = read_const_float(data, str_seg, off)
+                            if f is not None:
+                                val = f
+                            else:
+                                i = read_const_uint16(data, str_seg, off)
+                                if i is not None:
+                                    val = float(i)
+                    variables[var] = val
+        idx_i = line.find("INPUT -> ")
+        if idx_i != -1:
+            var = line[idx_i+len("INPUT -> "):].strip()
+            if var and var not in variables:
+                variables[var] = None
+
+    var_lines = []
+    if variables:
+        var_lines = ["; ----- VARIABLES -----"]
+        for var in sorted(variables.keys()):
+            val = variables[var]
+            if val is not None:
+                val_short = f"{val:.6g}" if isinstance(val, float) else str(val)
+                var_lines.append(f"; {var} = {val_short} (initial)")
+            else:
+                var_lines.append(f"; {var}")
+        var_lines.append("; ---------------------")
+
+    # 3. КОРРЕКЦИЯ УСЛОВИЙ В СТРОКАХ ПСЕВДОКОДА
+    # Находим все строки с IF (...) GOTO и исправляем в них порядок операндов
+    new_lines = []
+    for line in lines:
+        m_if = re.match(r"^(CODE:\w+): IF \(([^)]+)\) GOTO (.+)$", line)
+        if m_if:
+            addr = m_if.group(1)
+            cond = m_if.group(2)
+            goto = m_if.group(3)
+            # Заменяем имена констант на их значения
+            cond = re.sub(r"V_[0-9a-f]+", lambda m: const_defs.get(m.group(0), m.group(0)), cond)
+            # Если слева число, а справа переменная – меняем местами
+            m_flip = re.match(r"^([-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)\s*(==|!=|<=|>=|<|>)\s*(V_[0-9a-f]+|ARR_.*)$", cond)
+            if m_flip:
+                val, op, var = m_flip.group(1), m_flip.group(2), m_flip.group(3)
+                cond = f"{var} {op} {val}"
+            new_lines.append(f"{addr}: IF ({cond}) GOTO {goto}")
+        else:
+            new_lines.append(line)
+    lines = new_lines
+
+    # 4. Замена V_XXXX на значения во всём коде (кроме блоков констант/переменных и левых частей FORMULA/INPUT)
+    def replace_const(match):
+        var = match.group(0)
+        if var in const_defs:
+            return const_defs[var]
+        return var
+
+    final_lines = []
+    for line in lines:
+        if line.startswith("; -----") or line.startswith("; V_") or line.startswith("; ---"):
+            final_lines.append(line)
+        elif re.match(r"^\s*(FORMULA|INPUT ->)", line):
+            final_lines.append(line)
+        else:
+            new_line = re.sub(r"V_[0-9a-f]+", replace_const, line)
+            final_lines.append(new_line)
+
+    final_lines = const_lines + var_lines + final_lines
+
     with open(f"{args.out}_pseudocode.txt",'w',encoding='utf-8') as f:
-        f.write("\n".join(lines))
-    print(f"[+] Псевдокод: {len(lines)} строк -> {args.out}_pseudocode.txt")
+        f.write("\n".join(final_lines))
+    print(f"[+] Псевдокод: {len(final_lines)} строк -> {args.out}_pseudocode.txt")
     print("[+] Done.")
 
 if __name__=="__main__":

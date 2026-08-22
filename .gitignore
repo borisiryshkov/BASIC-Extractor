@@ -1,4 +1,6 @@
 *
-!basic_extractor.py
+!cfg_builder.py
+!decoder.py
+!test_cfg.py
 !.gitignore
 !README.md

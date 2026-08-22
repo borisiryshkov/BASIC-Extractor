@@ -10,7 +10,7 @@ def parse_mz_header(data):
     h['header_bytes'] = h['e_cparhdr'] * 16
     return h
 
-with open('/mnt/user-data/uploads/KONN2_UN.EXE','rb') as f:
+with open('<...>','rb') as f:
     data = f.read()
 
 header = parse_mz_header(data)

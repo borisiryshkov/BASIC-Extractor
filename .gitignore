@@ -2,5 +2,9 @@
 !cfg_builder.py
 !decoder.py
 !test_cfg.py
+!dos_emu.py
+!pseudocode.py
+!run_full_pseudocode.py
+!structuring.py
 !.gitignore
 !README.md

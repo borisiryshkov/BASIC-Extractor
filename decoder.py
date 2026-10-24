@@ -1,13 +1,13 @@
 """
-decoder.py — декодирование ОДНОЙ инструкции за раз (не диапазона).
-Это строительный блок для worklist/CFG-дизассемблера: в отличие от
-линейного disasm_range(start,end), здесь нет понятия "конец диапазона" —
-только "дай мне одну инструкцию с этого адреса и её длину".
+decoder.py -- decode ONE instruction at a time (not a whole range).
+This is the building block for the worklist/CFG disassembler: unlike a
+linear disasm_range(start,end), there is no notion of "end of range" here --
+just "give me one instruction at this address and its length".
 """
 import struct, re
 from capstone import Cs, CS_ARCH_X86, CS_MODE_16
 
-# ================= x87 "ESC-через-INT" =================
+# ================= x87 "ESC-via-INT" =================
 def modrm_mem_operand(mod, rm, bytes_at):
     bases = {0:"BX+SI",1:"BX+DI",2:"BP+SI",3:"BP+DI",4:"SI",5:"DI",6:"BP",7:"BX"}
     if mod == 0 and rm == 6:
@@ -102,13 +102,14 @@ class Instr:
         self.length = length
         self.fpu_mem_near = fpu_mem_near
         self.is_call = False
-        self.is_jmp = False           # безусловный jmp (near)
-        self.is_jcc = False           # условный переход
+        self.is_jmp = False           # unconditional (near) jmp
+        self.is_jcc = False           # conditional jump
         self.is_ret = False
-        self.is_indirect = False      # jmp/call через регистр или память —
-                                       # цель НЕ известна статически, мы её не
-                                       # знаем и не гадаем — просто фиксируем факт
-        self.target = None            # абсолютный файловый адрес цели (если есть)
+        self.is_indirect = False      # jmp/call through a register or memory --
+                                       # the target is NOT known statically, we
+                                       # don't know it and don't guess -- we just
+                                       # record the fact
+        self.target = None            # absolute file address of the target (if any)
 
     def __repr__(self):
         return f"<{self.kind} @0x{self.addr:x} {self.mnemonic!r} len={self.length}>"
@@ -122,18 +123,18 @@ _LJMP_RE = re.compile(r"^ljmp\s+(0x[0-9a-f]+):(0x[0-9a-f]+)$")
 
 
 def seg_off_to_file_addr(header_bytes, seg, off):
-    """Переводит (сегмент, смещение) из инструкции lcall в абсолютный файловый
-       адрес. Сегмент в самих байтах инструкции — это НАСТОЯЩИЙ относительный
-       сегмент (0 = начало загружаемого модуля, т.е. header_bytes), БЕЗ какого-
-       либо сдвига."""
+    """Converts (segment, offset) from an lcall instruction into an absolute
+       file address. The segment in the instruction bytes itself is a REAL
+       relative segment (0 = start of the loaded module, i.e. header_bytes),
+       WITHOUT any shift applied."""
     return header_bytes + seg * 16 + off
 
 
 def decode_one(data, addr, header_bytes=None):
-    """Декодирует ровно одну инструкцию по абсолютному файловому адресу addr.
-       header_bytes нужен только для перевода целей lcall (SEG:OFF) в
-       абсолютный файловый адрес — если он не передан, lcall не считается
-       передачей управления (просто обычная инструкция)."""
+    """Decodes exactly one instruction at absolute file address addr.
+       header_bytes is only needed to convert lcall targets (SEG:OFF) into
+       an absolute file address -- if it isn't passed, lcall is not treated
+       as a control-flow transfer (just a plain instruction)."""
     if addr >= len(data):
         return Instr(addr, 'BAD', 'out-of-bounds', 1)
 
@@ -192,8 +193,9 @@ def decode_one(data, addr, header_bytes=None):
         instr.target = int(m.group(2), 16)
         return instr
 
-    # Косвенный call/jmp/lcall (через регистр или память) — цель НЕ известна
-    # статически. Явно фиксируем такой случай и НЕ продолжаем поток отсюда.
+    # Indirect call/jmp/lcall (through a register or memory) -- the target is
+    # NOT known statically. We explicitly record this case and do NOT
+    # continue the flow from here.
     if mnemonic.startswith('jmp') or mnemonic.startswith('call') or mnemonic.startswith('lcall') or mnemonic.startswith('ljmp'):
         instr.is_indirect = True
         if 'call' in mnemonic:
